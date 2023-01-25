@@ -161,6 +161,7 @@ class BinaryReaderIR : public BinaryReaderNop {
 
   Result OnStartFunction(Index func_index) override;
 
+  Result BeginCodeSection(Offset size) override;
   Result OnFunctionBodyCount(Index count) override;
   Result BeginFunctionBody(Index index, Offset size) override;
   Result OnLocalDecl(Index decl_index, Index count, Type type) override;
@@ -313,6 +314,11 @@ class BinaryReaderIR : public BinaryReaderNop {
                      Index index,
                      std::string_view name) override;
 
+  Result OnReloc(RelocType type,
+                 Offset offset,
+                 Index index,
+                 uint32_t addend) override;
+
   Result BeginTagSection(Offset size) override { return Result::Ok; }
   Result OnTagCount(Index count) override { return Result::Ok; }
   Result OnTagType(Index index, Index sig_index) override;
@@ -374,6 +380,8 @@ class BinaryReaderIR : public BinaryReaderNop {
   Result SetDataSegmentName(Index index, std::string_view name);
   Result SetElemSegmentName(Index index, std::string_view name);
   Result SetTagName(Index index, std::string_view name);
+  Result ValidateFunctionSymbol(Index symbol_index);
+  Result ValidateDataSegmentSymbol(Index symbol_index);
 
   std::string GetUniqueName(BindingHash* bindings,
                             const std::string& original_name);
@@ -719,6 +727,11 @@ Result BinaryReaderIR::OnExport(Index index,
 Result BinaryReaderIR::OnStartFunction(Index func_index) {
   Var start(func_index, GetLocation());
   module_->AppendField(MakeUnique<StartModuleField>(start, GetLocation()));
+  return Result::Ok;
+}
+
+Result BinaryReaderIR::BeginCodeSection(Offset size) {
+  module_->code_section_base_ = GetLocation().offset;
   return Result::Ok;
 }
 
@@ -1552,6 +1565,74 @@ Result BinaryReaderIR::OnNameEntry(NameSectionSubsection type,
   return Result::Ok;
 }
 
+Result BinaryReaderIR::ValidateFunctionSymbol(Index symbol_index) {
+  if (module_->function_index_by_symbol_index_.find(symbol_index) ==
+      module_->function_index_by_symbol_index_.end()) {
+    PrintError("expected function symbol index, found %" PRIindex,
+               symbol_index);
+    return Result::Error;
+  }
+  return Result::Ok;
+}
+
+Result BinaryReaderIR::ValidateDataSegmentSymbol(Index symbol_index) {
+  if (module_->data_segment_index_by_symbol_index_.find(symbol_index) ==
+      module_->data_segment_index_by_symbol_index_.end()) {
+    PrintError("expected data segment index, found %" PRIindex, symbol_index);
+    return Result::Error;
+  }
+  return Result::Ok;
+}
+
+Result BinaryReaderIR::OnReloc(RelocType type,
+                               Offset offset,
+                               Index index,
+                               uint32_t addend) {
+  if (!options_.no_sandbox) {
+    return Result::Ok;
+  }
+  switch (type) {
+    case RelocType::TableIndexSLEB:
+    case RelocType::TableIndexSLEB64:
+      CHECK_RESULT(ValidateFunctionSymbol(index));
+      module_->function_reloc_by_function_pointer_load_offset_[offset] =
+          module_->function_index_by_symbol_index_[index];
+      break;
+    case RelocType::TableIndexI32:
+      CHECK_RESULT(ValidateFunctionSymbol(index));
+      module_->function_reloc_by_fptr32_init_offset_[offset] =
+          module_->function_index_by_symbol_index_[index];
+      break;
+    case RelocType::TableIndexI64:
+      CHECK_RESULT(ValidateFunctionSymbol(index));
+      module_->function_reloc_by_fptr64_init_offset_[offset] =
+          module_->function_index_by_symbol_index_[index];
+      break;
+    case RelocType::MemoryAddressSLEB:
+    case RelocType::MemoryAddressSLEB64:
+    case RelocType::MemoryAddressLEB:
+    case RelocType::MemoryAddressLEB64:
+      CHECK_RESULT(ValidateDataSegmentSymbol(index));
+      module_->data_reloc_by_memory_pointer_load_offset_[offset] =
+          std::make_pair(module_->data_segment_index_by_symbol_index_[index],
+                         addend);
+      break;
+    case RelocType::MemoryAddressI32:
+      CHECK_RESULT(ValidateDataSegmentSymbol(index));
+      module_->data_reloc_by_mptr32_init_offset_[offset] = std::make_pair(
+          module_->data_segment_index_by_symbol_index_[index], addend);
+      break;
+    case RelocType::MemoryAddressI64:
+      CHECK_RESULT(ValidateDataSegmentSymbol(index));
+      module_->data_reloc_by_mptr64_init_offset_[offset] = std::make_pair(
+          module_->data_segment_index_by_symbol_index_[index], addend);
+      break;
+    default:
+      break;
+  }
+  return Result::Ok;
+}
+
 Result BinaryReaderIR::OnLocalNameLocalCount(Index index, Index count) {
   assert(index < module_->funcs.size());
   Func* func = module_->funcs[index];
@@ -1619,21 +1700,22 @@ Result BinaryReaderIR::OnDataSymbol(Index index,
                                     Index segment,
                                     uint32_t offset,
                                     uint32_t size) {
-  if (name.empty()) {
-    return Result::Ok;
-  }
   if (flags & WABT_SYMBOL_FLAG_UNDEFINED) {
     // Refers to data in another file, `segment` not valid.
+    return Result::Ok;
+  }
+  if (segment >= module_->data_segments.size()) {
+    PrintError("invalid data segment index: %" PRIindex, segment);
+    return Result::Error;
+  }
+  module_->data_segment_index_by_symbol_index_[index] = segment;
+  if (name.empty()) {
     return Result::Ok;
   }
   if (offset) {
     // If it is pointing into the data segment, then it's not really naming
     // the whole segment.
     return Result::Ok;
-  }
-  if (segment >= module_->data_segments.size()) {
-    PrintError("invalid data segment index: %" PRIindex, segment);
-    return Result::Error;
   }
   DataSegment* seg = module_->data_segments[segment];
   std::string dollar_name =
@@ -1647,12 +1729,13 @@ Result BinaryReaderIR::OnFunctionSymbol(Index index,
                                         uint32_t flags,
                                         std::string_view name,
                                         Index func_index) {
-  if (name.empty()) {
-    return Result::Ok;
-  }
   if (func_index >= module_->funcs.size()) {
     PrintError("invalid function index: %" PRIindex, func_index);
     return Result::Error;
+  }
+  module_->function_index_by_symbol_index_[index] = func_index;
+  if (name.empty()) {
+    return Result::Ok;
   }
   Func* func = module_->funcs[func_index];
   if (!func->name.empty()) {
