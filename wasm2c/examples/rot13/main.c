@@ -53,16 +53,13 @@ int main(int argc, char** argv) {
   /* Initialize the Wasm runtime. */
   wasm_rt_init();
 
-  /* Initialize the rot13 module. */
-  Z_rot13_init_module();
-
   /* Declare an instance of the `rot13` module. */
   Z_rot13_instance_t rot13_instance;
 
   /* Create a `host` module instance to store the memory and current string */
   struct Z_host_instance_t host_instance;
   /* Allocate 1 page of wasm memory (64KiB). */
-  wasm_rt_allocate_memory(&host_instance.memory, 1, 1);
+  wasm_rt_allocate_memory(&host_instance.memory, 1, 1, false);
 
   /* Construct the module instance */
   Z_rot13_instantiate(&rot13_instance, &host_instance);
