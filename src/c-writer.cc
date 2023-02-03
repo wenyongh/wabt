@@ -322,6 +322,12 @@ class CWriter {
     Allowed,
   };
 
+  bool TryWriteNoSandboxFunctionAddress(Offset instruction_offset,
+                                        bool is64bit);
+  bool TryWriteNoSandboxMemoryAddress(Offset instruction_offset,
+                                      bool is64bit,
+                                      const std::string& prefix = "");
+
   void WriteSimpleUnaryExpr(Opcode, const char* op);
   void WriteInfixBinaryExpr(Opcode,
                             const char* op,
@@ -331,6 +337,7 @@ class CWriter {
   void Write(const BinaryExpr&);
   void Write(const CompareExpr&);
   void Write(const ConvertExpr&);
+  void Write(const ConstExpr&);
   void Write(const LoadExpr&);
   void Write(const StoreExpr&);
   void Write(const UnaryExpr&);
@@ -2556,12 +2563,9 @@ void CWriter::Write(const ExprList& exprs) {
         Write(*cast<CompareExpr>(&expr));
         break;
 
-      case ExprType::Const: {
-        const Const& const_ = cast<ConstExpr>(&expr)->const_;
-        PushType(const_.type());
-        Write(StackVar(0), " = ", const_, ";", Newline());
+      case ExprType::Const:
+        Write(*cast<ConstExpr>(&expr));
         break;
-      }
 
       case ExprType::Convert:
         Write(*cast<ConvertExpr>(&expr));
@@ -3958,6 +3962,75 @@ void CWriter::Write(const ConvertExpr& expr) {
     default:
       WABT_UNREACHABLE;
   }
+}
+
+bool CWriter::TryWriteNoSandboxFunctionAddress(Offset instruction_offset,
+                                               bool is64bit) {
+  // For i32.const the constant value is encoded as a 5-byte varint32;
+  // for i64.const it is a 10-byte varint64.
+  int index_byte_length = is64bit ? 10 : 5;
+  Offset reloc_offset =
+      instruction_offset - index_byte_length - module_->code_section_base_;
+  auto& function_reloc_map =
+      module_->function_symbol_by_function_pointer_load_offset_;
+  auto function_reloc = function_reloc_map.find(reloc_offset);
+  if (function_reloc == function_reloc_map.end()) {
+    return false;
+  }
+  Index symbol_index = function_reloc->second;
+  Index func_index = module_->function_symbols_.at(symbol_index);
+  const std::string& func_name = module_->funcs[func_index]->name;
+  Write("reinterpret_cast<u", is64bit ? "64" : "32", ">(&",
+        GlobalName(ModuleFieldType::Func, func_name), ")");
+  return true;
+}
+
+bool CWriter::TryWriteNoSandboxMemoryAddress(Offset instruction_offset,
+                                             bool is64bit,
+                                             const std::string& prefix) {
+  // For i32.{load*,store} the offset is encoded as a 5-byte varuint32;
+  // for the i64.* variety it is a 10-byte varuint64.
+  int index_byte_length = is64bit ? 10 : 5;
+  Offset reloc_offset =
+      instruction_offset - index_byte_length - module_->code_section_base_;
+  const auto& data_reloc_map =
+      module_->data_symbol_and_addend_by_memory_pointer_load_offset_;
+  auto data_reloc = data_reloc_map.find(reloc_offset);
+  if (data_reloc == data_reloc_map.end()) {
+    return false;
+  }
+  Write(prefix, "reinterpret_cast<u", is64bit ? "64" : "32", ">(&");
+  auto [data_symbol_index, addend] = data_reloc->second;
+  auto data_segment_index_ptr = module_->data_symbols_.find(data_symbol_index);
+  if (data_segment_index_ptr == module_->data_symbols_.end()) {
+    const std::string& external_name =
+        module_->undefined_data_symbols_.at(data_symbol_index);
+    Write(external_name);
+  } else {
+    Index data_segment_index = data_segment_index_ptr->second;
+    const std::string& data_segment_name =
+        module_->data_segments[data_segment_index]->name;
+    Write("data_segment_data_",
+          GlobalName(ModuleFieldType::DataSegment, data_segment_name));
+  }
+  Write(")");
+  if (addend > 0) {
+    Write(" + ", addend, "u");
+  }
+  return true;
+}
+
+void CWriter::Write(const ConstExpr& expr) {
+  const Const& const_ = expr.const_;
+  bool is64bit = const_.type() == Type::I64;
+  PushType(const_.type());
+  Write(StackVar(0), " = ");
+  if (!options_.no_sandbox ||
+      (!TryWriteNoSandboxFunctionAddress(expr.loc.offset, is64bit) &&
+       !TryWriteNoSandboxMemoryAddress(expr.loc.offset, is64bit))) {
+    Write(const_);
+  }
+  Write(";", Newline());
 }
 
 void CWriter::Write(const LoadExpr& expr) {
