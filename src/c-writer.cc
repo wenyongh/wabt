@@ -292,9 +292,13 @@ class CWriter {
   void WriteTable(const std::string&, const wabt::Type&);
   void WriteTablePtr(const std::string&, const Table&);
   void WriteTableType(const wabt::Type&);
+  void WriteBytes(const DataSegment* segment,
+                  size_t start_index,
+                  size_t end_index);
   void WriteDataInstances();
   void WriteElemInstances();
   void WriteGlobalInitializers();
+  void WriteNoSandboxDataSegments();
   void WriteDataInitializers();
   void WriteElemInitializers();
   void WriteElemTableInit(bool, const ElemSegment*, const Table*);
@@ -322,6 +326,8 @@ class CWriter {
     Allowed,
   };
 
+  void WriteFunctionAddress(Index symbol_index, bool is64bit);
+  void WriteDataAddress(Index symbol_index, uint32_t addend, bool is64bit);
   bool TryWriteNoSandboxFunctionAddress(Offset instruction_offset,
                                         bool is64bit);
   bool TryWriteNoSandboxMemoryAddress(Offset instruction_offset,
@@ -1502,8 +1508,154 @@ void CWriter::WriteDataInstances() {
   }
 }
 
+void CWriter::WriteBytes(const DataSegment* segment,
+                         size_t start_index,
+                         size_t end_index) {
+  Write(OpenBrace());
+  for (size_t i = start_index; i < end_index; ++i) {
+    Writef("0x%02x,", segment->data.at(i));
+    if ((i - start_index + 1) % 12 == 0) {
+      Write(Newline());
+    } else if (i < end_index - 1) {
+      Write(" ");
+    }
+  }
+  if ((end_index - start_index) % 12 != 0) {
+    Write(Newline());
+  }
+  Write(CloseBrace());
+}
+
+void CWriter::WriteNoSandboxDataSegments() {
+  // Forward-declare all struct names and data segments.
+  Write(Newline());
+  for (const DataSegment* data_segment : module_->data_segments) {
+    Write("extern struct ", "data_struct_",
+          GlobalName(ModuleFieldType::DataSegment, data_segment->name), " ",
+          "data_segment_data_",
+          GlobalName(ModuleFieldType::DataSegment, data_segment->name), ";",
+          Newline());
+  }
+
+  // Define data segments with initializers.
+  for (const DataSegment* data_segment : module_->data_segments) {
+    if (data_segment->data.empty()) {
+      continue;
+    }
+    if (is_droppable(data_segment)) {
+      UNIMPLEMENTED("droppable data segment in no-sandbox mode");
+    }
+
+    Offset ceiling = module_->data_segment_reloc_to_address_
+                         .lower_bound(data_segment->data_offset)
+                         ->second +
+                     1;
+    Offset base = ceiling - data_segment->data.size();
+
+    // Survey the data initialiser relocation maps.
+    bool is64bit = false;  // found at least one 64-bit pointer initializer
+    std::map<Offset, bool>
+        reloc_map;  // true for function pointers, false for data pointers
+
+    const auto& f64map = module_->function_symbol_by_fptr64_init_offset_;
+    const auto& d64map = module_->data_symbol_and_addend_by_mptr64_init_offset_;
+    const auto& f32map = module_->function_symbol_by_fptr32_init_offset_;
+    const auto& d32map = module_->data_symbol_and_addend_by_mptr32_init_offset_;
+    for (auto f64 = f64map.lower_bound(base);
+         f64 != f64map.end() && f64->first < ceiling; ++f64) {
+      is64bit = true;
+      reloc_map[f64->first] = true;
+    }
+    for (auto d64 = d64map.lower_bound(base);
+         d64 != d64map.end() && d64->first < ceiling; ++d64) {
+      is64bit = true;
+      reloc_map[d64->first] = false;
+    }
+    for (auto f32 = f32map.lower_bound(base);
+         f32 != f32map.end() && f32->first < ceiling; ++f32) {
+      if (is64bit) {
+        UNIMPLEMENTED(
+            "32-bit function pointer initializer in 64-bit no-sandbox mode");
+      }
+      reloc_map[f32->first] = true;
+    }
+    for (auto d32 = d32map.lower_bound(base);
+         d32 != d32map.end() && d32->first < ceiling; ++d32) {
+      if (is64bit) {
+        UNIMPLEMENTED(
+            "32-bit data pointer initializer in 64-bit no-sandbox mode");
+      }
+      reloc_map[d32->first] = false;
+    }
+
+    const auto& fmap = is64bit ? f64map : f32map;
+    const auto& dmap = is64bit ? d64map : d32map;
+
+    Write(Newline(), "struct data_struct_",
+          GlobalName(ModuleFieldType::DataSegment, data_segment->name), " ",
+          OpenBrace());
+    {
+      Offset cur = base;
+      while (cur < ceiling) {
+        auto next_reloc = reloc_map.lower_bound(cur);
+        Offset next =
+            next_reloc == reloc_map.end() || next_reloc->first >= ceiling
+                ? ceiling
+                : next_reloc->first;
+        if (next != cur) {
+          Write("u8 plain_data_at_", cur - base, "[", next - cur, "];",
+                Newline());
+        }
+        if (next < ceiling) {
+          bool is_function = next_reloc->second;
+          Write(is64bit ? "u64" : "u32", " ", is_function ? "function" : "data",
+                "_pointer_at_", next - base, ";", Newline());
+          next += is64bit ? 8 : 4;
+        }
+        cur = next;
+      }
+    }
+
+    Write(CloseBrace(), " data_segment_data_",
+          GlobalName(ModuleFieldType::DataSegment, data_segment->name), " = ",
+          OpenBrace());
+    {
+      Offset cur = base;
+      while (cur < ceiling) {
+        auto next_reloc = reloc_map.lower_bound(cur);
+        Offset next =
+            next_reloc == reloc_map.end() || next_reloc->first >= ceiling
+                ? ceiling
+                : next_reloc->first;
+        if (next != cur) {
+          WriteBytes(data_segment, cur - base, next - base);
+          Write(",", Newline());
+        }
+        if (next < ceiling) {
+          bool is_function = next_reloc->second;
+          if (is_function) {
+            WriteFunctionAddress(fmap.at(next), is64bit);
+          } else {
+            auto [data_symbol_index, addend] = dmap.at(next);
+            WriteDataAddress(data_symbol_index, addend, is64bit);
+          }
+          Write(",", Newline());
+          next += is64bit ? 8 : 4;
+        }
+        cur = next;
+      }
+    }
+    Write(CloseBrace(), ";", Newline());
+  }
+}
+
 void CWriter::WriteDataInitializers() {
   if (module_->memories.empty()) {
+    return;
+  }
+
+  if (options_.no_sandbox) {
+    WriteNoSandboxDataSegments();
     return;
   }
 
@@ -3968,6 +4120,35 @@ void CWriter::Write(const ConvertExpr& expr) {
   }
 }
 
+void CWriter::WriteFunctionAddress(Index symbol_index, bool is64bit) {
+  Index func_index = module_->function_symbols_.at(symbol_index);
+  const std::string& func_name = module_->funcs[func_index]->name;
+  Write("(u", is64bit ? "64" : "32", ")(&",
+        GlobalName(ModuleFieldType::Func, func_name), ")");
+}
+
+void CWriter::WriteDataAddress(Index symbol_index,
+                               uint32_t addend,
+                               bool is64bit) {
+  Write("(u", is64bit ? "64" : "32", ")(&");
+  auto data_segment_index_ptr = module_->data_symbols_.find(symbol_index);
+  if (data_segment_index_ptr == module_->data_symbols_.end()) {
+    const std::string& external_name =
+        module_->undefined_data_symbols_.at(symbol_index);
+    Write(external_name);
+  } else {
+    Index data_segment_index = data_segment_index_ptr->second;
+    const std::string& data_segment_name =
+        module_->data_segments[data_segment_index]->name;
+    Write("data_segment_data_",
+          GlobalName(ModuleFieldType::DataSegment, data_segment_name));
+  }
+  Write(")");
+  if (addend > 0) {
+    Write(" + ", addend, "u");
+  }
+}
+
 bool CWriter::TryWriteNoSandboxFunctionAddress(Offset instruction_offset,
                                                bool is64bit) {
   // For i32.const the constant value is encoded as a 5-byte varint32;
@@ -3981,11 +4162,7 @@ bool CWriter::TryWriteNoSandboxFunctionAddress(Offset instruction_offset,
   if (function_reloc == function_reloc_map.end()) {
     return false;
   }
-  Index symbol_index = function_reloc->second;
-  Index func_index = module_->function_symbols_.at(symbol_index);
-  const std::string& func_name = module_->funcs[func_index]->name;
-  Write("reinterpret_cast<u", is64bit ? "64" : "32", ">(&",
-        GlobalName(ModuleFieldType::Func, func_name), ")");
+  WriteFunctionAddress(function_reloc->second, is64bit);
   return true;
 }
 
@@ -4003,24 +4180,9 @@ bool CWriter::TryWriteNoSandboxMemoryAddress(Offset instruction_offset,
   if (data_reloc == data_reloc_map.end()) {
     return false;
   }
-  Write(prefix, "reinterpret_cast<u", is64bit ? "64" : "32", ">(&");
+  Write(prefix);
   auto [data_symbol_index, addend] = data_reloc->second;
-  auto data_segment_index_ptr = module_->data_symbols_.find(data_symbol_index);
-  if (data_segment_index_ptr == module_->data_symbols_.end()) {
-    const std::string& external_name =
-        module_->undefined_data_symbols_.at(data_symbol_index);
-    Write(external_name);
-  } else {
-    Index data_segment_index = data_segment_index_ptr->second;
-    const std::string& data_segment_name =
-        module_->data_segments[data_segment_index]->name;
-    Write("data_segment_data_",
-          GlobalName(ModuleFieldType::DataSegment, data_segment_name));
-  }
-  Write(")");
-  if (addend > 0) {
-    Write(" + ", addend, "u");
-  }
+  WriteDataAddress(data_symbol_index, addend, is64bit);
   return true;
 }
 
