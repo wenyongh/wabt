@@ -2710,20 +2710,33 @@ void CWriter::Write(const ExprList& exprs) {
           Write(StackVar(num_params, decl.GetResultType(0)), " = ");
         }
 
-        const Table* table =
-            module_->GetTable(cast<CallIndirectExpr>(&expr)->table);
+        bool needs_comma = false;
+        if (options_.no_sandbox) {
+          Write("((");
+          WriteCallIndirectFuncDeclaration(decl, "(*)");
+          Write(")", StackVar(0), ")(");
+        } else {
+          const Table* table =
+              module_->GetTable(cast<CallIndirectExpr>(&expr)->table);
 
-        assert(decl.has_func_type);
-        const FuncType* func_type = module_->GetFuncType(decl.type_var);
+          assert(decl.has_func_type);
+          const FuncType* func_type = module_->GetFuncType(decl.type_var);
 
-        Write("CALL_INDIRECT(",
-              ExternalInstanceRef(ModuleFieldType::Table, table->name), ", ");
-        WriteCallIndirectFuncDeclaration(decl, "(*)");
-        Write(", ", FuncTypeExpr(func_type), ", ", StackVar(0));
-        Write(", ", ExternalInstanceRef(ModuleFieldType::Table, table->name),
-              ".data[", StackVar(0), "].module_instance");
+          Write("CALL_INDIRECT(",
+                ExternalInstanceRef(ModuleFieldType::Table, table->name), ", ");
+          WriteCallIndirectFuncDeclaration(decl, "(*)");
+          Write(", ", FuncTypeExpr(func_type), ", ", StackVar(0));
+          Write(", ", ExternalInstanceRef(ModuleFieldType::Table, table->name),
+                ".data[", StackVar(0), "].module_instance");
+          needs_comma = true;
+        }
         for (Index i = 0; i < num_params; ++i) {
-          Write(", ", StackVar(num_params - i));
+          if (needs_comma) {
+            Write(", ");
+          } else {
+            needs_comma = true;
+          }
+          Write(StackVar(num_params - i));
         }
         Write(");", Newline());
         DropTypes(num_params + 1);
