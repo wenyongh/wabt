@@ -293,6 +293,14 @@ Result TypeChecker::PopAndCheck1Type(Type expected, const char* desc) {
   return result;
 }
 
+Result TypeChecker::PopAndCheckCallIndirectTableIndex(const char* desc) {
+  if (features_.sandbox_enabled() || !features_.memory64_enabled() ||
+      PeekAndCheckType(0, Type::I64) != Result::Ok) {
+    return PopAndCheck1Type(Type::I32, desc);
+  }
+  return DropTypes(1);
+}
+
 Result TypeChecker::PopAndCheck2Types(Type expected1,
                                       Type expected2,
                                       const char* desc) {
@@ -506,7 +514,7 @@ Result TypeChecker::OnCall(const TypeVector& param_types,
 
 Result TypeChecker::OnCallIndirect(const TypeVector& param_types,
                                    const TypeVector& result_types) {
-  Result result = PopAndCheck1Type(Type::I32, "call_indirect");
+  Result result = PopAndCheckCallIndirectTableIndex("call_indirect");
   result |= PopAndCheckCall(param_types, result_types, "call_indirect");
   return result;
 }
@@ -546,7 +554,7 @@ Result TypeChecker::OnReturnCall(const TypeVector& param_types,
 
 Result TypeChecker::OnReturnCallIndirect(const TypeVector& param_types,
                                          const TypeVector& result_types) {
-  Result result = PopAndCheck1Type(Type::I32, "return_call_indirect");
+  Result result = PopAndCheckCallIndirectTableIndex("return_call_indirect");
 
   result |= PopAndCheckSignature(param_types, "return_call_indirect");
   Label* func_label;
