@@ -18,6 +18,7 @@
 #define WABT_C_WRITER_H_
 
 #include "wabt/common.h"
+#include "wabt/feature.h"
 
 namespace wabt {
 
@@ -25,8 +26,11 @@ struct Module;
 class Stream;
 
 struct WriteCOptions {
+  // Caller keeps ownership of Feauters object and must keep it alive for the
+  // lifetime of the options object.
+  explicit WriteCOptions(const Features* features) : features(*features) {}
   std::string_view module_name;
-  bool no_sandbox;
+  const Features& features;
 };
 
 Result WriteC(Stream* c_stream,
