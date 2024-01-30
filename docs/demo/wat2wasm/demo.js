@@ -24,32 +24,24 @@ var features = {};
 
 WabtModule().then(function(wabt) {
 
-var FEATURES = [
-  'exceptions',
-  'mutable_globals',
-  'sat_float_to_int',
-  'sign_extension',
-  'simd',
-  'threads',
-  'multi_value',
-  'tail_call',
-  'bulk_memory',
-  'reference_types',
-];
-
 var kCompileMinMS = 100;
+var outputShowBase64 = false;
+var outputLog;
+var outputBase64;
 
 var outputEl = document.getElementById('output');
 var jsLogEl = document.getElementById('js_log');
 var selectEl = document.getElementById('select');
 var downloadEl = document.getElementById('download');
 var downloadLink = document.getElementById('downloadLink');
+var buildLogEl = document.getElementById('buildLog');
+var base64El = document.getElementById('base64');
 var binaryBuffer = null;
 var binaryBlobUrl = null;
 
-for (var feature of FEATURES) {
-  var featureEl = document.getElementById(feature);
-  features[feature] = featureEl.checked;
+for (const [f, v] of Object.entries(wabt.FEATURES)) {
+  var featureEl = document.getElementById(f);
+  featureEl.checked = v;
   featureEl.addEventListener('change', event => {
     var feature = event.target.id;
     features[feature] = event.target.checked;
@@ -101,15 +93,21 @@ function debounce(f, wait) {
 }
 
 function compile() {
-  outputEl.textContent = '';
+  outputLog = '';
+  outputBase64 = 'Error occured, base64 output is not available';
+
   var binaryOutput;
   try {
     var module = wabt.parseWat('test.wast', watEditor.getValue(), features);
     module.resolveNames();
     module.validate(features);
     var binaryOutput = module.toBinary({log: true, write_debug_names:true});
-    outputEl.textContent = binaryOutput.log;
+    outputLog = binaryOutput.log;
     binaryBuffer = binaryOutput.buffer;
+    // binaryBuffer is a Uint8Array, so we need to convert it to a string to use btoa
+    // https://stackoverflow.com/questions/12710001/how-to-convert-uint8-array-to-base64-encoded-string
+    outputBase64 = btoa(String.fromCharCode.apply(null, binaryBuffer));
+
     var blob = new Blob([binaryOutput.buffer]);
     if (binaryBlobUrl) {
       URL.revokeObjectURL(binaryBlobUrl);
@@ -118,10 +116,11 @@ function compile() {
     downloadLink.setAttribute('href', binaryBlobUrl);
     downloadEl.classList.remove('disabled');
   } catch (e) {
-    outputEl.textContent += e.toString();
+    outputLog += e.toString();
     downloadEl.classList.add('disabled');
   } finally {
     if (module) module.destroy();
+    outputEl.textContent = outputShowBase64 ? outputBase64 : outputLog;
   }
 }
 
@@ -163,10 +162,26 @@ function onDownloadClicked(e) {
   downloadLink.dispatchEvent(event);
 }
 
+function onBuildLogClicked(e) {
+  outputShowBase64 = false;
+  outputEl.textContent = outputLog;
+  buildLogEl.style.textDecoration = 'underline';
+  base64El.style.textDecoration = 'none';
+}
+
+function onBase64Clicked(e) {
+  outputShowBase64 = true;
+  outputEl.textContent = outputBase64;
+  buildLogEl.style.textDecoration = 'none';
+  base64El.style.textDecoration = 'underline';
+}
+
 watEditor.on('change', onWatChange);
 jsEditor.on('change', onJsChange);
 selectEl.addEventListener('change', onSelectChanged);
 downloadEl.addEventListener('click', onDownloadClicked);
+buildLogEl.addEventListener('click', onBuildLogClicked );
+base64El.addEventListener('click', onBase64Clicked );
 
 for (var i = 0; i < examples.length; ++i) {
   var example = examples[i];

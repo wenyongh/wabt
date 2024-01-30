@@ -17,23 +17,23 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
-#include "config.h"
+#include "wabt/config.h"
 
-#include "src/binary-writer.h"
-#include "src/common.h"
-#include "src/error-formatter.h"
-#include "src/feature.h"
-#include "src/filenames.h"
-#include "src/ir.h"
-#include "src/option-parser.h"
-#include "src/resolve-names.h"
-#include "src/stream.h"
-#include "src/validator.h"
-#include "src/wast-parser.h"
+#include "wabt/binary-writer.h"
+#include "wabt/common.h"
+#include "wabt/error-formatter.h"
+#include "wabt/feature.h"
+#include "wabt/filenames.h"
+#include "wabt/ir.h"
+#include "wabt/option-parser.h"
+#include "wabt/resolve-names.h"
+#include "wabt/stream.h"
+#include "wabt/validator.h"
+#include "wabt/wast-parser.h"
 
 using namespace wabt;
 
@@ -49,11 +49,11 @@ static Features s_features;
 static std::unique_ptr<FileStream> s_log_stream;
 
 static const char s_description[] =
-R"(  read a file in the wasm text format, check it for errors, and
+    R"(  read a file in the wasm text format, check it for errors, and
   convert it to the wasm binary format.
 
 examples:
-  # parse and typecheck test.wat
+  # parse test.wat and write to .wasm binary file with the same name
   $ wat2wasm test.wat
 
   # parse test.wat and write to binary file test.wasm
@@ -77,7 +77,8 @@ static void ParseOptions(int argc, char* argv[]) {
                    "Print a hexdump of the module to stdout",
                    []() { s_dump_module = true; });
   s_features.AddOptions(&parser);
-  parser.AddOption('o', "output", "FILE", "output wasm binary file",
+  parser.AddOption('o', "output", "FILE",
+                   "Output wasm binary file. Use \"-\" to write to stdout.",
                    [](const char* argument) { s_outfile = argument; });
   parser.AddOption(
       'r', "relocatable",
@@ -98,7 +99,7 @@ static void ParseOptions(int argc, char* argv[]) {
   parser.Parse(argc, argv);
 }
 
-static void WriteBufferToFile(string_view filename,
+static void WriteBufferToFile(std::string_view filename,
                               const OutputBuffer& buffer) {
   if (s_dump_module) {
     std::unique_ptr<FileStream> stream = FileStream::CreateStdout();
@@ -110,10 +111,14 @@ static void WriteBufferToFile(string_view filename,
     }
   }
 
-  buffer.WriteToFile(filename);
+  if (filename == "-") {
+    buffer.WriteToStdout();
+  } else {
+    buffer.WriteToFile(filename);
+  }
 }
 
-static std::string DefaultOuputName(string_view input_name) {
+static std::string DefaultOuputName(std::string_view input_name) {
   // Strip existing extension and add .wasm
   std::string result(StripExtension(GetBasename(input_name)));
   result += kWasmExtension;
@@ -128,13 +133,13 @@ int ProgramMain(int argc, char** argv) {
 
   std::vector<uint8_t> file_data;
   Result result = ReadFile(s_infile, &file_data);
+  Errors errors;
   std::unique_ptr<WastLexer> lexer = WastLexer::CreateBufferLexer(
-      s_infile, file_data.data(), file_data.size());
+      s_infile, file_data.data(), file_data.size(), &errors);
   if (Failed(result)) {
     WABT_FATAL("unable to read file: %s\n", s_infile);
   }
 
-  Errors errors;
   std::unique_ptr<Module> module;
   WastParseOptions parse_wast_options(s_features);
   result = ParseWatModule(lexer.get(), &module, &errors, &parse_wast_options);

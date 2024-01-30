@@ -16,12 +16,12 @@
 
 #include <wasm.h>
 
-#include "src/binary-reader.h"
-#include "src/cast.h"
-#include "src/error-formatter.h"
-#include "src/interp/binary-reader-interp.h"
-#include "src/interp/interp-util.h"
-#include "src/interp/interp.h"
+#include "wabt/binary-reader.h"
+#include "wabt/cast.h"
+#include "wabt/error-formatter.h"
+#include "wabt/interp/binary-reader-interp.h"
+#include "wabt/interp/interp-util.h"
+#include "wabt/interp/interp.h"
 
 using namespace wabt;
 using namespace wabt::interp;
@@ -48,7 +48,7 @@ static std::unique_ptr<FileStream> s_stdout_stream;
 static ValueType ToWabtValueType(wasm_valkind_t);
 static wasm_valkind_t FromWabtValueType(ValueType);
 
-static wasm_externkind_t FromWabtExternKind(ExternKind );
+static wasm_externkind_t FromWabtExternKind(ExternKind);
 
 static ValueTypes ToWabtValueTypes(const wasm_valtype_vec_t* types);
 static void FromWabtValueTypes(const ValueTypes&, wasm_valtype_vec_t* out);
@@ -63,9 +63,9 @@ static wasm_limits_t FromWabtLimits(const Limits&);
 static TypedValue ToWabtValue(const wasm_val_t&);
 static wasm_val_t FromWabtValue(Store&, const TypedValue&);
 
-static Values ToWabtValues(const wasm_val_t values[], size_t count);
+static Values ToWabtValues(const wasm_val_vec_t* values);
 static void FromWabtValues(Store& store,
-                           wasm_val_t values[],
+                           wasm_val_vec_t* values,
                            const ValueTypes& types,
                            const Values& wabt_values);
 
@@ -81,17 +81,17 @@ struct wasm_valtype_t {
 struct wasm_externtype_t {
   static std::unique_ptr<wasm_externtype_t> New(std::unique_ptr<ExternType>);
 
-  std::unique_ptr<wasm_externtype_t> Clone() const {
-    return New(I->Clone());
-  }
+  std::unique_ptr<wasm_externtype_t> Clone() const { return New(I->Clone()); }
 
   virtual ~wasm_externtype_t() {}
 
   wasm_externtype_t(const wasm_externtype_t& other) = delete;
-  wasm_externtype_t& operator=(const wasm_externtype_t& other)  = delete;
+  wasm_externtype_t& operator=(const wasm_externtype_t& other) = delete;
 
   template <typename T>
-  T* As() const { return cast<T>(I.get()); }
+  T* As() const {
+    return cast<T>(I.get());
+  }
 
   std::unique_ptr<ExternType> I;
 
@@ -102,12 +102,14 @@ struct wasm_externtype_t {
 struct wasm_functype_t : wasm_externtype_t {
   wasm_functype_t(own wasm_valtype_vec_t* params,
                   own wasm_valtype_vec_t* results)
-      : wasm_externtype_t{MakeUnique<FuncType>(ToWabtValueTypes(params),
-                                               ToWabtValueTypes(results))},
+      : wasm_externtype_t{std::make_unique<FuncType>(
+            ToWabtValueTypes(params),
+            ToWabtValueTypes(results))},
         params(*params),
         results(*results) {}
 
-  wasm_functype_t(FuncType ft) : wasm_externtype_t{MakeUnique<FuncType>(ft)} {
+  wasm_functype_t(FuncType ft)
+      : wasm_externtype_t{std::make_unique<FuncType>(ft)} {
     FromWabtValueTypes(ft.params, &params);
     FromWabtValueTypes(ft.results, &results);
   }
@@ -124,14 +126,14 @@ struct wasm_functype_t : wasm_externtype_t {
 
 struct wasm_globaltype_t : wasm_externtype_t {
   wasm_globaltype_t(own wasm_valtype_t* type, wasm_mutability_t mut)
-      : wasm_externtype_t{MakeUnique<GlobalType>(type->I,
-                                                 ToWabtMutability(mut))},
+      : wasm_externtype_t{std::make_unique<GlobalType>(type->I,
+                                                       ToWabtMutability(mut))},
         valtype{*type} {
     wasm_valtype_delete(type);
   }
 
   wasm_globaltype_t(GlobalType gt)
-      : wasm_externtype_t{MakeUnique<GlobalType>(gt)}, valtype{gt.type} {}
+      : wasm_externtype_t{std::make_unique<GlobalType>(gt)}, valtype{gt.type} {}
 
   // Stored here because API requires returning pointers.
   wasm_valtype_t valtype;
@@ -139,15 +141,15 @@ struct wasm_globaltype_t : wasm_externtype_t {
 
 struct wasm_tabletype_t : wasm_externtype_t {
   wasm_tabletype_t(own wasm_valtype_t* type, const wasm_limits_t* limits)
-      : wasm_externtype_t{MakeUnique<TableType>(type->I,
-                                                ToWabtLimits(*limits))},
+      : wasm_externtype_t{std::make_unique<TableType>(type->I,
+                                                      ToWabtLimits(*limits))},
         elemtype(*type),
         limits(*limits) {
     wasm_valtype_delete(type);
   }
 
   wasm_tabletype_t(TableType tt)
-      : wasm_externtype_t{MakeUnique<TableType>(tt)},
+      : wasm_externtype_t{std::make_unique<TableType>(tt)},
         elemtype{tt.element},
         limits{FromWabtLimits(tt.limits)} {}
 
@@ -158,11 +160,11 @@ struct wasm_tabletype_t : wasm_externtype_t {
 
 struct wasm_memorytype_t : wasm_externtype_t {
   wasm_memorytype_t(const wasm_limits_t* limits)
-      : wasm_externtype_t{MakeUnique<MemoryType>(ToWabtLimits(*limits))},
+      : wasm_externtype_t{std::make_unique<MemoryType>(ToWabtLimits(*limits))},
         limits{*limits} {}
 
   wasm_memorytype_t(MemoryType mt)
-      : wasm_externtype_t{MakeUnique<MemoryType>(mt)},
+      : wasm_externtype_t{std::make_unique<MemoryType>(mt)},
         limits{FromWabtLimits(mt.limits)} {}
 
   // Stored here because API requires returning pointers.
@@ -174,16 +176,16 @@ std::unique_ptr<wasm_externtype_t> wasm_externtype_t::New(
     std::unique_ptr<ExternType> ptr) {
   switch (ptr->kind) {
     case ExternKind::Func:
-      return MakeUnique<wasm_functype_t>(*cast<FuncType>(ptr.get()));
+      return std::make_unique<wasm_functype_t>(*cast<FuncType>(ptr.get()));
 
     case ExternKind::Table:
-      return MakeUnique<wasm_tabletype_t>(*cast<TableType>(ptr.get()));
+      return std::make_unique<wasm_tabletype_t>(*cast<TableType>(ptr.get()));
 
     case ExternKind::Memory:
-      return MakeUnique<wasm_memorytype_t>(*cast<MemoryType>(ptr.get()));
+      return std::make_unique<wasm_memorytype_t>(*cast<MemoryType>(ptr.get()));
 
     case ExternKind::Global:
-      return MakeUnique<wasm_globaltype_t>(*cast<GlobalType>(ptr.get()));
+      return std::make_unique<wasm_globaltype_t>(*cast<GlobalType>(ptr.get()));
 
     case ExternKind::Tag:
       break;
@@ -251,7 +253,9 @@ struct wasm_ref_t {
   wasm_ref_t(RefPtr<Object> ptr) : I(ptr) {}
 
   template <typename T>
-  T* As() const { return cast<T>(I.get()); }
+  T* As() const {
+    return cast<T>(I.get());
+  }
 
   RefPtr<Object> I;
 };
@@ -285,9 +289,7 @@ struct wasm_module_t : wasm_ref_t {
     return *this;
   }
 
-  ~wasm_module_t() {
-    wasm_byte_vec_delete(&binary);
-  }
+  ~wasm_module_t() { wasm_byte_vec_delete(&binary); }
   // TODO: This is used for wasm_module_serialize/wasm_module_deserialize.
   // Currently the standard wasm binary bytes are cached here, but it would be
   // better to have a serialization of ModuleDesc instead.
@@ -478,21 +480,23 @@ static wasm_limits_t FromWabtLimits(const Limits& limits) {
   return wasm_limits_t{(uint32_t)limits.initial, (uint32_t)limits.max};
 }
 
-static Values ToWabtValues(const wasm_val_t values[], size_t count) {
+static Values ToWabtValues(const wasm_val_vec_t* values) {
   Values result;
-  for (size_t i = 0; i < count; ++i) {
-    result.push_back(ToWabtValue(values[i]).value);
+  for (size_t i = 0; i < values->size; ++i) {
+    result.push_back(ToWabtValue(values->data[i]).value);
   }
   return result;
 }
 
 static void FromWabtValues(Store& store,
-                           wasm_val_t values[],
+                           wasm_val_vec_t* values,
                            const ValueTypes& types,
                            const Values& wabt_values) {
   assert(types.size() == wabt_values.size());
+  assert(types.size() == values->size);
   for (size_t i = 0; i < types.size(); ++i) {
-    values[i] = FromWabtValue(store, TypedValue{types[i], wabt_values[i]});
+    values->data[i] =
+        FromWabtValue(store, TypedValue{types[i], wabt_values[i]});
   }
 }
 
@@ -537,21 +541,21 @@ static void print_sig(const FuncType& sig) {
 #ifndef NDEBUG
   fprintf(stderr, "(");
   bool first = true;
-  for (auto Type : sig.params) {
+  for (auto type : sig.params) {
     if (!first) {
       fprintf(stderr, ", ");
     }
     first = false;
-    fprintf(stderr, "%s", Type.GetName());
+    fprintf(stderr, "%s", type.GetName().c_str());
   }
   fprintf(stderr, ") -> (");
   first = true;
-  for (auto Type : sig.results) {
+  for (auto type : sig.results) {
     if (!first) {
       fprintf(stderr, ", ");
     }
     first = false;
-    fprintf(stderr, "%s", Type.GetName());
+    fprintf(stderr, "%s", type.GetName().c_str());
   }
   fprintf(stderr, ")\n");
 #endif
@@ -632,8 +636,8 @@ own wasm_module_t* wasm_module_new(wasm_store_t* store,
                                    const wasm_byte_vec_t* binary) {
   Errors errors;
   ModuleDesc module_desc;
-  if (Failed(ReadBinaryInterp(binary->data, binary->size, GetOptions(), &errors,
-                              &module_desc))) {
+  if (Failed(ReadBinaryInterp("<internal>", binary->data, binary->size,
+                              GetOptions(), &errors, &module_desc))) {
     FormatErrorsToFile(errors, Location::Type::Binary);
     return nullptr;
   }
@@ -726,7 +730,7 @@ const wasm_externtype_t* wasm_exporttype_type(const wasm_exporttype_t* ex) {
 
 own wasm_instance_t* wasm_instance_new(wasm_store_t* store,
                                        const wasm_module_t* module,
-                                       const wasm_extern_t* const imports[],
+                                       const wasm_extern_vec_t* imports,
                                        own wasm_trap_t** trap_out) {
   TRACE("%p %p", store, module);
   assert(module);
@@ -734,7 +738,7 @@ own wasm_instance_t* wasm_instance_new(wasm_store_t* store,
 
   RefVec import_refs;
   for (size_t i = 0; i < module->As<Module>()->import_types().size(); i++) {
-    import_refs.push_back(imports[i]->I->self());
+    import_refs.push_back(imports->data[i]->I->self());
   }
 
   Trap::Ptr trap;
@@ -790,8 +794,8 @@ own wasm_func_t* wasm_func_new(wasm_store_t* store,
     wasm_val_vec_t params, results;
     wasm_val_vec_new_uninitialized(&params, wabt_params.size());
     wasm_val_vec_new_uninitialized(&results, wabt_results.size());
-    FromWabtValues(store->I, params.data, wabt_type.params, wabt_params);
-    auto trap = callback(params.data, results.data);
+    FromWabtValues(store->I, &params, wabt_type.params, wabt_params);
+    auto trap = callback(&params, &results);
     wasm_val_vec_delete(&params);
     if (trap) {
       *out_trap = trap->I.As<Trap>();
@@ -800,7 +804,7 @@ own wasm_func_t* wasm_func_new(wasm_store_t* store,
       delete[] results.data;
       return Result::Error;
     }
-    wabt_results = ToWabtValues(results.data, results.size);
+    wabt_results = ToWabtValues(&results);
     wasm_val_vec_delete(&results);
     return Result::Ok;
   };
@@ -819,8 +823,8 @@ own wasm_func_t* wasm_func_new_with_env(wasm_store_t* store,
     wasm_val_vec_t params, results;
     wasm_val_vec_new_uninitialized(&params, wabt_params.size());
     wasm_val_vec_new_uninitialized(&results, wabt_results.size());
-    FromWabtValues(store->I, params.data, wabt_type.params, wabt_params);
-    auto trap = callback(env, params.data, results.data);
+    FromWabtValues(store->I, &params, wabt_type.params, wabt_params);
+    auto trap = callback(env, &params, &results);
     wasm_val_vec_delete(&params);
     if (trap) {
       *out_trap = trap->I.As<Trap>();
@@ -829,7 +833,7 @@ own wasm_func_t* wasm_func_new_with_env(wasm_store_t* store,
       delete[] results.data;
       return Result::Error;
     }
-    wabt_results = ToWabtValues(results.data, results.size);
+    wabt_results = ToWabtValues(&results);
     wasm_val_vec_delete(&results);
     return Result::Ok;
   };
@@ -852,13 +856,13 @@ size_t wasm_func_param_arity(const wasm_func_t* func) {
 }
 
 own wasm_trap_t* wasm_func_call(const wasm_func_t* f,
-                                const wasm_val_t args[],
-                                wasm_val_t results[]) {
+                                const wasm_val_vec_t* args,
+                                wasm_val_vec_t* results) {
   // TODO: get some information about the function; name/index
   // TRACE("%d", f->index);
 
   auto&& func_type = f->As<Func>()->type();
-  Values wabt_args = ToWabtValues(args, func_type.params.size());
+  Values wabt_args = ToWabtValues(args);
   Values wabt_results;
   Trap::Ptr trap;
   if (Failed(
@@ -1175,24 +1179,24 @@ void wasm_val_vec_delete(own wasm_val_vec_t* vec) {
 WASM_IMPL_VEC_OWN(frame);
 WASM_IMPL_VEC_OWN(extern);
 
-#define WASM_IMPL_TYPE(name)                                        \
-  WASM_IMPL_OWN(name)                                               \
-  WASM_IMPL_VEC_OWN(name)                                           \
-  own wasm_##name##_t* wasm_##name##_copy(wasm_##name##_t* other) { \
-    TRACE0();                                                       \
-    return new wasm_##name##_t(*other);                             \
+#define WASM_IMPL_TYPE(name)                                              \
+  WASM_IMPL_OWN(name)                                                     \
+  WASM_IMPL_VEC_OWN(name)                                                 \
+  own wasm_##name##_t* wasm_##name##_copy(const wasm_##name##_t* other) { \
+    TRACE0();                                                             \
+    return new wasm_##name##_t(*other);                                   \
   }
 
 WASM_IMPL_TYPE(valtype);
 WASM_IMPL_TYPE(importtype);
 WASM_IMPL_TYPE(exporttype);
 
-#define WASM_IMPL_TYPE_CLONE(name)                                  \
-  WASM_IMPL_OWN(name)                                               \
-  WASM_IMPL_VEC_OWN(name)                                           \
-  own wasm_##name##_t* wasm_##name##_copy(wasm_##name##_t* other) { \
-    TRACE0();                                                       \
-    return static_cast<wasm_##name##_t*>(other->Clone().release()); \
+#define WASM_IMPL_TYPE_CLONE(name)                                        \
+  WASM_IMPL_OWN(name)                                                     \
+  WASM_IMPL_VEC_OWN(name)                                                 \
+  own wasm_##name##_t* wasm_##name##_copy(const wasm_##name##_t* other) { \
+    TRACE0();                                                             \
+    return static_cast<wasm_##name##_t*>(other->Clone().release());       \
   }
 
 WASM_IMPL_TYPE_CLONE(functype);

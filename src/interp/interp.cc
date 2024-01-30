@@ -14,14 +14,13 @@
  * limitations under the License.
  */
 
-#include "src/interp/interp.h"
+#include "wabt/interp/interp.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
 
-#include "src/interp/interp-math.h"
-#include "src/make-unique.h"
+#include "wabt/interp/interp-math.h"
 
 namespace wabt {
 namespace interp {
@@ -31,7 +30,7 @@ const char* GetName(Mutability mut) {
   return kNames[int(mut)];
 }
 
-const char* GetName(ValueType type) {
+const std::string GetName(ValueType type) {
   return type.GetName();
 }
 
@@ -41,9 +40,12 @@ const char* GetName(ExternKind kind) {
 
 const char* GetName(ObjectKind kind) {
   static const char* kNames[] = {
-      "Null",   "Foreign", "Trap", "DefinedFunc", "HostFunc", "Table",
-      "Memory", "Global",  "Tag",  "Module",      "Instance", "Thread",
+      "Null",  "Foreign", "Trap",   "Exception", "DefinedFunc", "HostFunc",
+      "Table", "Memory",  "Global", "Tag",       "Module",      "Instance",
   };
+
+  WABT_STATIC_ASSERT(WABT_ARRAY_SIZE(kNames) == kCommandTypeCount);
+
   return kNames[int(kind)];
 }
 
@@ -81,7 +83,7 @@ Result Match(const Limits& expected,
 
 //// FuncType ////
 std::unique_ptr<ExternType> FuncType::Clone() const {
-  return MakeUnique<FuncType>(*this);
+  return std::make_unique<FuncType>(*this);
 }
 
 Result Match(const FuncType& expected,
@@ -98,16 +100,16 @@ Result Match(const FuncType& expected,
 
 //// TableType ////
 std::unique_ptr<ExternType> TableType::Clone() const {
-  return MakeUnique<TableType>(*this);
+  return std::make_unique<TableType>(*this);
 }
 
 Result Match(const TableType& expected,
              const TableType& actual,
              std::string* out_msg) {
   if (expected.element != actual.element) {
-    *out_msg =
-        StringPrintf("type mismatch in imported table, expected %s but got %s.",
-                     GetName(expected.element), GetName(actual.element));
+    *out_msg = StringPrintf(
+        "type mismatch in imported table, expected %s but got %s.",
+        GetName(expected.element).c_str(), GetName(actual.element).c_str());
     return Result::Error;
   }
 
@@ -120,7 +122,7 @@ Result Match(const TableType& expected,
 
 //// MemoryType ////
 std::unique_ptr<ExternType> MemoryType::Clone() const {
-  return MakeUnique<MemoryType>(*this);
+  return std::make_unique<MemoryType>(*this);
 }
 
 Result Match(const MemoryType& expected,
@@ -131,7 +133,7 @@ Result Match(const MemoryType& expected,
 
 //// GlobalType ////
 std::unique_ptr<ExternType> GlobalType::Clone() const {
-  return MakeUnique<GlobalType>(*this);
+  return std::make_unique<GlobalType>(*this);
 }
 
 Result Match(const GlobalType& expected,
@@ -149,7 +151,7 @@ Result Match(const GlobalType& expected,
        !TypesMatch(expected.type, actual.type))) {
     *out_msg = StringPrintf(
         "type mismatch in imported global, expected %s but got %s.",
-        GetName(expected.type), GetName(actual.type));
+        GetName(expected.type).c_str(), GetName(actual.type).c_str());
     return Result::Error;
   }
 
@@ -158,13 +160,18 @@ Result Match(const GlobalType& expected,
 
 //// TagType ////
 std::unique_ptr<ExternType> TagType::Clone() const {
-  return MakeUnique<TagType>(*this);
+  return std::make_unique<TagType>(*this);
 }
 
 Result Match(const TagType& expected,
              const TagType& actual,
              std::string* out_msg) {
-  // TODO signature
+  if (expected.signature != actual.signature) {
+    if (out_msg) {
+      *out_msg = "signature mismatch in imported tag";
+    }
+    return Result::Error;
+  }
   return Result::Ok;
 }
 
@@ -200,6 +207,7 @@ Store::Store(const Features& features) : features_(features) {
   roots_.New(ref);
 }
 
+#ifndef NDEBUG
 bool Store::HasValueType(Ref ref, ValueType type) const {
   // TODO opt?
   if (!IsValid(ref)) {
@@ -212,7 +220,7 @@ bool Store::HasValueType(Ref ref, ValueType type) const {
     return true;
   }
 
-  Object* obj = objects_.Get(ref.index).get();
+  Object* obj = objects_.Get(ref.index);
   switch (type) {
     case ValueType::FuncRef:
       return obj->kind() == ObjectKind::DefinedFunc ||
@@ -221,6 +229,7 @@ bool Store::HasValueType(Ref ref, ValueType type) const {
       return false;
   }
 }
+#endif
 
 Store::RootList::Index Store::NewRoot(Ref ref) {
   return roots_.New(ref);
@@ -241,8 +250,11 @@ void Store::DeleteRoot(RootList::Index index) {
 
 void Store::Collect() {
   size_t object_count = objects_.size();
-  marks_.resize(object_count);
-  std::fill(marks_.begin(), marks_.end(), false);
+
+  assert(gc_context_.call_depth == 0);
+
+  gc_context_.marks.resize(object_count);
+  std::fill(gc_context_.marks.begin(), gc_context_.marks.end(), false);
 
   // First mark all roots.
   for (RootList::Index i = 0; i < roots_.size(); ++i) {
@@ -251,35 +263,52 @@ void Store::Collect() {
     }
   }
 
-  // TODO: better GC algo.
-  // Loop through all newly marked objects and mark their referents.
-  std::vector<bool> all_marked(object_count, false);
-  bool new_marked;
-  do {
-    new_marked = false;
-    for (size_t i = 0; i < object_count; ++i) {
-      if (!all_marked[i] && marks_[i]) {
-        all_marked[i] = true;
-        objects_.Get(i)->Mark(*this);
-        new_marked = true;
-      }
-    }
-  } while (new_marked);
+  for (auto thread : threads_) {
+    thread->Mark();
+  }
+
+  // This vector is often empty since the default maximum
+  // recursion is usually enough to mark all objects.
+  while (WABT_UNLIKELY(!gc_context_.untraced_objects.empty())) {
+    size_t index = gc_context_.untraced_objects.back();
+
+    assert(gc_context_.marks[index]);
+    assert(gc_context_.call_depth == 0);
+
+    gc_context_.untraced_objects.pop_back();
+    objects_.Get(index)->Mark(*this);
+  }
+
+  assert(gc_context_.call_depth == 0);
 
   // Delete all unmarked objects.
   for (size_t i = 0; i < object_count; ++i) {
-    if (objects_.IsUsed(i) && !all_marked[i]) {
+    if (objects_.IsUsed(i) && !gc_context_.marks[i]) {
       objects_.Delete(i);
     }
   }
 }
 
 void Store::Mark(Ref ref) {
-  marks_[ref.index] = true;
+  size_t index = ref.index;
+
+  if (gc_context_.marks[index])
+    return;
+
+  gc_context_.marks[index] = true;
+
+  if (WABT_UNLIKELY(gc_context_.call_depth >= max_call_depth)) {
+    gc_context_.untraced_objects.push_back(index);
+    return;
+  }
+
+  gc_context_.call_depth++;
+  objects_.Get(index)->Mark(*this);
+  gc_context_.call_depth--;
 }
 
 void Store::Mark(const RefVec& refs) {
-  for (auto&& ref: refs) {
+  for (auto&& ref : refs) {
     Mark(ref);
   }
 }
@@ -310,6 +339,21 @@ Trap::Trap(Store& store,
 void Trap::Mark(Store& store) {
   for (auto&& frame : trace_) {
     frame.Mark(store);
+  }
+}
+
+//// Exception ////
+Exception::Exception(Store& store, Ref tag, Values& args)
+    : Object(skind), tag_(tag), args_(args) {}
+
+void Exception::Mark(Store& store) {
+  Tag::Ptr tag(store, tag_);
+  store.Mark(tag_);
+  ValueTypes params = tag->type().signature;
+  for (size_t i = 0; i < params.size(); i++) {
+    if (params[i].IsRef()) {
+      store.Mark(args_[i].Get<Ref>());
+    }
   }
 }
 
@@ -346,10 +390,8 @@ Result Func::Call(Store& store,
                   Values& results,
                   Trap::Ptr* out_trap,
                   Stream* trace_stream) {
-  Thread::Options options;
-  options.trace_stream = trace_stream;
-  Thread::Ptr thread = Thread::New(store, options);
-  return DoCall(*thread, params, results, out_trap);
+  Thread thread(store, trace_stream);
+  return DoCall(thread, params, results, out_trap);
 }
 
 Result Func::Call(Thread& thread,
@@ -385,6 +427,11 @@ Result DefinedFunc::DoCall(Thread& thread,
   }
   result = thread.Run(out_trap);
   if (result == RunResult::Trap) {
+    return Result::Error;
+  } else if (result == RunResult::Exception) {
+    // While this is not actually a trap, it is a convenient way
+    // to report an uncaught exception.
+    *out_trap = Trap::New(thread.store(), "uncaught exception");
     return Result::Error;
   }
   thread.PopValues(type_.results, &results);
@@ -444,7 +491,8 @@ Ref Table::UnsafeGet(u32 offset) const {
 }
 
 Result Table::Set(Store& store, u32 offset, Ref ref) {
-  if (IsValidRange(offset, 1) && store.HasValueType(ref, type_.element)) {
+  assert(store.HasValueType(ref, type_.element));
+  if (IsValidRange(offset, 1)) {
     elements_[offset] = ref;
     return Result::Ok;
   }
@@ -454,8 +502,11 @@ Result Table::Set(Store& store, u32 offset, Ref ref) {
 Result Table::Grow(Store& store, u32 count, Ref ref) {
   size_t old_size = elements_.size();
   u32 new_size;
-  if (store.HasValueType(ref, type_.element) &&
-      CanGrow<u32>(type_.limits, old_size, count, &new_size)) {
+  assert(store.HasValueType(ref, type_.element));
+  if (CanGrow<u32>(type_.limits, old_size, count, &new_size)) {
+    // Grow the limits of the table too, so that if it is used as an
+    // import to another module its new size is honored.
+    type_.limits.initial += count;
     elements_.resize(new_size);
     Fill(store, old_size, ref, new_size - old_size);
     return Result::Ok;
@@ -464,8 +515,8 @@ Result Table::Grow(Store& store, u32 count, Ref ref) {
 }
 
 Result Table::Fill(Store& store, u32 offset, Ref ref, u32 size) {
-  if (IsValidRange(offset, size) &&
-      store.HasValueType(ref, type_.element)) {
+  assert(store.HasValueType(ref, type_.element));
+  if (IsValidRange(offset, size)) {
     std::fill(elements_.begin() + offset, elements_.begin() + offset + size,
               ref);
     return Result::Ok;
@@ -529,6 +580,9 @@ Result Memory::Match(class Store& store,
 Result Memory::Grow(u64 count) {
   u64 new_pages;
   if (CanGrow<u64>(type_.limits, pages_, count, &new_pages)) {
+    // Grow the limits of the memory too, so that if it is used as an
+    // import to another module its new size is honored.
+    type_.limits.initial += count;
 #if WABT_BIG_ENDIAN
     auto old_size = data_.size();
 #endif
@@ -600,31 +654,18 @@ Result Memory::Copy(Memory& dst,
   return Result::Error;
 }
 
-Value Instance::ResolveInitExpr(Store& store, InitExpr init) {
-  Value result;
-  switch (init.kind) {
-    case InitExprKind::I32:      result.Set(init.i32_); break;
-    case InitExprKind::I64:      result.Set(init.i64_); break;
-    case InitExprKind::F32:      result.Set(init.f32_); break;
-    case InitExprKind::F64:      result.Set(init.f64_); break;
-    case InitExprKind::V128:     result.Set(init.v128_); break;
-    case InitExprKind::GlobalGet: {
-      Global::Ptr global{store, globals_[init.index_]};
-      result = global->Get();
-      break;
-    }
-    case InitExprKind::RefFunc: {
-      result.Set(funcs_[init.index_]);
-      break;
-    }
-    case InitExprKind::RefNull:
-      result.Set(Ref::Null);
-      break;
-
-    case InitExprKind::None:
-      WABT_UNREACHABLE;
+Result Instance::CallInitFunc(Store& store,
+                              const Ref func_ref,
+                              Value* result,
+                              Trap::Ptr* out_trap) {
+  Values results;
+  Func::Ptr func{store, func_ref};
+  if (Failed(func->Call(store, {}, results, out_trap))) {
+    return Result::Error;
   }
-  return result;
+  assert(results.size() == 1);
+  *result = results[0];
+  return Result::Ok;
 }
 
 //// Global ////
@@ -643,12 +684,9 @@ Result Global::Match(Store& store,
   return MatchImpl(store, import_type, type_, out_trap);
 }
 
-Result Global::Set(Store& store, Ref ref) {
-  if (store.HasValueType(ref, type_.type)) {
-    value_.Set(ref);
-    return Result::Ok;
-  }
-  return Result::Error;
+void Global::Set(Store& store, Ref ref) {
+  assert(store.HasValueType(ref, type_.type));
+  value_.Set(ref);
 }
 
 void Global::UnsafeSet(Value value) {
@@ -667,19 +705,19 @@ Result Tag::Match(Store& store,
 }
 
 //// ElemSegment ////
-ElemSegment::ElemSegment(const ElemDesc* desc, Instance::Ptr& inst)
+ElemSegment::ElemSegment(Store& store,
+                         const ElemDesc* desc,
+                         Instance::Ptr& inst)
     : desc_(desc) {
+  Trap::Ptr out_trap;
   elements_.reserve(desc->elements.size());
   for (auto&& elem_expr : desc->elements) {
-    switch (elem_expr.kind) {
-      case ElemKind::RefNull:
-        elements_.emplace_back(Ref::Null);
-        break;
-
-      case ElemKind::RefFunc:
-        elements_.emplace_back(inst->funcs_[elem_expr.index]);
-        break;
+    Value value;
+    Ref func_ref = DefinedFunc::New(store, inst.ref(), elem_expr).ref();
+    if (Failed(inst->CallInitFunc(store, func_ref, &value, &out_trap))) {
+      WABT_UNREACHABLE;  // valid const expression cannot trap
     }
+    elements_.push_back(value.Get<Ref>());
   }
 }
 
@@ -700,11 +738,11 @@ bool DataSegment::IsValidRange(u64 offset, u64 size) const {
 //// Module ////
 Module::Module(Store&, ModuleDesc desc)
     : Object(skind), desc_(std::move(desc)) {
-  for (auto&& import: desc_.imports) {
+  for (auto&& import : desc_.imports) {
     import_types_.emplace_back(import.type);
   }
 
-  for (auto&& export_: desc_.exports) {
+  for (auto&& export_ : desc_.exports) {
     export_types_.emplace_back(export_.type);
   }
 }
@@ -779,9 +817,12 @@ Instance::Ptr Instance::Instantiate(Store& store,
 
   // Globals.
   for (auto&& desc : mod->desc().globals) {
-    inst->globals_.push_back(
-        Global::New(store, desc.type, inst->ResolveInitExpr(store, desc.init))
-            .ref());
+    Value value;
+    Ref func_ref = DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+    if (Failed(inst->CallInitFunc(store, func_ref, &value, out_trap))) {
+      return {};
+    }
+    inst->globals_.push_back(Global::New(store, desc.type, value).ref());
   }
 
   // Tags.
@@ -790,7 +831,7 @@ Instance::Ptr Instance::Instantiate(Store& store,
   }
 
   // Exports.
-  for (auto&& desc : mod->desc().exports){
+  for (auto&& desc : mod->desc().exports) {
     Ref ref;
     switch (desc.type.type->kind) {
       case ExternKind::Func:   ref = inst->funcs_[desc.index]; break;
@@ -804,7 +845,7 @@ Instance::Ptr Instance::Instantiate(Store& store,
 
   // Elems.
   for (auto&& desc : mod->desc().elems) {
-    inst->elems_.emplace_back(&desc, inst);
+    inst->elems_.emplace_back(store, &desc, inst);
   }
 
   // Datas.
@@ -813,6 +854,10 @@ Instance::Ptr Instance::Instantiate(Store& store,
   }
 
   // Initialization.
+  // The MVP requires that all segments are bounds-checked before being copied
+  // into the table or memory. The bulk memory proposal changes this behavior;
+  // instead, each segment is copied in order. If any segment fails, then no
+  // further segments are copied. Any data that was written persists.
   enum Pass { Check, Init };
   int pass = store.features().bulk_memory_enabled() ? Init : Check;
   for (; pass <= Init; ++pass) {
@@ -822,13 +867,21 @@ Instance::Ptr Instance::Instantiate(Store& store,
       if (desc.mode == SegmentMode::Active) {
         Result result;
         Table::Ptr table{store, inst->tables_[desc.table_index]};
-        u32 offset = inst->ResolveInitExpr(store, desc.offset).Get<u32>();
+        Value value;
+        Ref func_ref =
+            DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+        if (Failed(inst->CallInitFunc(store, func_ref, &value, out_trap))) {
+          return {};
+        }
+        u32 offset = value.Get<u32>();
         if (pass == Check) {
           result = table->IsValidRange(offset, segment.size()) ? Result::Ok
                                                                : Result::Error;
         } else {
           result = table->Init(store, offset, segment, 0, segment.size());
-          segment.Drop();
+          if (Succeeded(result)) {
+            segment.Drop();
+          }
         }
 
         if (Failed(result)) {
@@ -850,7 +903,12 @@ Instance::Ptr Instance::Instantiate(Store& store,
       if (desc.mode == SegmentMode::Active) {
         Result result;
         Memory::Ptr memory{store, inst->memories_[desc.memory_index]};
-        Value offset_op = inst->ResolveInitExpr(store, desc.offset);
+        Value offset_op;
+        Ref func_ref =
+            DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+        if (Failed(inst->CallInitFunc(store, func_ref, &offset_op, out_trap))) {
+          return {};
+        }
         u64 offset = memory->type().limits.is_64 ? offset_op.Get<u64>()
                                                  : offset_op.Get<u32>();
         if (pass == Check) {
@@ -859,17 +917,18 @@ Instance::Ptr Instance::Instantiate(Store& store,
                        : Result::Error;
         } else {
           result = memory->Init(offset, segment, 0, segment.size());
-          segment.Drop();
+          if (Succeeded(result)) {
+            segment.Drop();
+          }
         }
 
         if (Failed(result)) {
           *out_trap = Trap::New(
-              store,
-              StringPrintf("out of bounds memory access: data segment is "
-                           "out of bounds: [%" PRIu64 ", %" PRIu64
-                           ") >= max value %"
-                           PRIu64, offset, offset + segment.size(),
-                           memory->ByteSize()));
+              store, StringPrintf(
+                         "out of bounds memory access: data segment is "
+                         "out of bounds: [%" PRIu64 ", %" PRIu64
+                         ") >= max value %" PRIu64,
+                         offset, offset + segment.size(), memory->ByteSize()));
           return {};
         }
       } else if (desc.mode == SegmentMode::Declared) {
@@ -905,23 +964,30 @@ void Instance::Mark(Store& store) {
 }
 
 //// Thread ////
-Thread::Thread(Store& store, const Options& options)
-    : Object(skind), store_(store) {
+Thread::Thread(Store& store, Stream* trace_stream)
+    : store_(store), trace_stream_(trace_stream) {
+  store.threads().insert(this);
+
+  Thread::Options options;
   frames_.reserve(options.call_stack_size);
   values_.reserve(options.value_stack_size);
-  trace_stream_ = options.trace_stream;
-  if (options.trace_stream) {
-    trace_source_ = MakeUnique<TraceSource>(this);
+  if (trace_stream) {
+    trace_source_ = std::make_unique<TraceSource>(this);
   }
 }
 
-void Thread::Mark(Store& store) {
+Thread::~Thread() {
+  store_.threads().erase(this);
+}
+
+void Thread::Mark() {
   for (auto&& frame : frames_) {
-    frame.Mark(store);
+    frame.Mark(store_);
   }
-  for (auto index: refs_) {
-    store.Mark(values_[index].Get<Ref>());
+  for (auto index : refs_) {
+    store_.Mark(values_[index].Get<Ref>());
   }
+  store_.Mark(exceptions_);
 }
 
 void Thread::PushValues(const ValueTypes& types, const Values& values) {
@@ -949,7 +1015,8 @@ Instance* Thread::GetCallerInstance() {
 
 RunResult Thread::PushCall(Ref func, u32 offset, Trap::Ptr* out_trap) {
   TRAP_IF(frames_.size() == frames_.capacity(), "call stack exhausted");
-  frames_.emplace_back(func, values_.size(), offset, inst_, mod_);
+  frames_.emplace_back(func, values_.size(), exceptions_.size(), offset, inst_,
+                       mod_);
   return RunResult::Ok;
 }
 
@@ -957,8 +1024,8 @@ RunResult Thread::PushCall(const DefinedFunc& func, Trap::Ptr* out_trap) {
   TRAP_IF(frames_.size() == frames_.capacity(), "call stack exhausted");
   inst_ = store_.UnsafeGet<Instance>(func.instance()).get();
   mod_ = store_.UnsafeGet<Module>(inst_->module()).get();
-  frames_.emplace_back(func.self(), values_.size(), func.desc().code_offset,
-                       inst_, mod_);
+  frames_.emplace_back(func.self(), values_.size(), exceptions_.size(),
+                       func.desc().code_offset, inst_, mod_);
   return RunResult::Ok;
 }
 
@@ -966,11 +1033,15 @@ RunResult Thread::PushCall(const HostFunc& func, Trap::Ptr* out_trap) {
   TRAP_IF(frames_.size() == frames_.capacity(), "call stack exhausted");
   inst_ = nullptr;
   mod_ = nullptr;
-  frames_.emplace_back(func.self(), values_.size(), 0, inst_, mod_);
+  frames_.emplace_back(func.self(), values_.size(), exceptions_.size(), 0,
+                       inst_, mod_);
   return RunResult::Ok;
 }
 
 RunResult Thread::PopCall() {
+  // Sanity check that the exception stack was popped correctly.
+  assert(frames_.back().exceptions == exceptions_.size());
+
   frames_.pop_back();
   if (frames_.empty()) {
     return RunResult::Return;
@@ -1011,7 +1082,7 @@ RunResult Thread::Run(Trap::Ptr* out_trap) {
 
 RunResult Thread::Run(int num_instructions, Trap::Ptr* out_trap) {
   DefinedFunc::Ptr func{store_, frames_.back().func};
-  for (;num_instructions > 0; --num_instructions) {
+  for (; num_instructions > 0; --num_instructions) {
     auto result = StepInternal(out_trap);
     if (result != RunResult::Ok) {
       return result;
@@ -1077,6 +1148,7 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     istream.Trace(trace_stream_, pc, trace_source_.get());
   }
 
+  // clang-format off
   auto instr = istream.Read(&pc);
   switch (instr.op) {
     case O::Unreachable:
@@ -1408,6 +1480,24 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
       break;
     }
 
+    case O::InterpCatchDrop: {
+      auto drop = instr.imm_u32;
+      for (u32 i = 0; i < drop; i++) {
+        exceptions_.pop_back();
+      }
+      break;
+    }
+
+    // This operation adjusts the function reference of the reused frame
+    // after a return_call. This ensures the correct exception handlers are
+    // used for the call.
+    case O::InterpAdjustFrameForReturnCall: {
+      Ref new_func_ref = inst_->funcs()[instr.imm_u32];
+      Frame& current_frame = frames_.back();
+      current_frame.func = new_func_ref;
+      break;
+    }
+
     case O::I32TruncSatF32S: return DoUnop(IntTruncSat<s32, f32>);
     case O::I32TruncSatF32U: return DoUnop(IntTruncSat<u32, f32>);
     case O::I32TruncSatF64S: return DoUnop(IntTruncSat<s32, f64>);
@@ -1524,8 +1614,14 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::V128And:       return DoSimdBinop(IntAnd<u64>);
     case O::V128Or:        return DoSimdBinop(IntOr<u64>);
     case O::V128Xor:       return DoSimdBinop(IntXor<u64>);
-    case O::V128BitSelect: return DoSimdBitSelect();
     case O::V128AnyTrue:      return DoSimdIsTrue<u8x16, 1>();
+
+    case O::V128BitSelect:
+    case O::I8X16RelaxedLaneSelect:
+    case O::I16X8RelaxedLaneSelect:
+    case O::I32X4RelaxedLaneSelect:
+    case O::I64X2RelaxedLaneSelect:
+      return DoSimdBitSelect();
 
     case O::I8X16Neg:          return DoSimdUnop(IntNeg<u8>);
     case O::I8X16Bitmask:      return DoSimdBitmask<s8x16>();
@@ -1603,10 +1699,16 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::F32X4Sub:          return DoSimdBinop(Sub<f32>);
     case O::F32X4Mul:          return DoSimdBinop(Mul<f32>);
     case O::F32X4Div:          return DoSimdBinop(FloatDiv<f32>);
-    case O::F32X4Min:          return DoSimdBinop(FloatMin<f32>);
-    case O::F32X4Max:          return DoSimdBinop(FloatMax<f32>);
     case O::F32X4PMin:         return DoSimdBinop(FloatPMin<f32>);
     case O::F32X4PMax:         return DoSimdBinop(FloatPMax<f32>);
+
+    case O::F32X4Min:
+    case O::F32X4RelaxedMin:
+      return DoSimdBinop(FloatMin<f32>);
+
+    case O::F32X4Max:
+    case O::F32X4RelaxedMax:
+      return DoSimdBinop(FloatMax<f32>);
 
     case O::F64X2Abs:          return DoSimdUnop(FloatAbs<f64>);
     case O::F64X2Neg:          return DoSimdUnop(FloatNeg<f64>);
@@ -1615,23 +1717,44 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::F64X2Sub:          return DoSimdBinop(Sub<f64>);
     case O::F64X2Mul:          return DoSimdBinop(Mul<f64>);
     case O::F64X2Div:          return DoSimdBinop(FloatDiv<f64>);
-    case O::F64X2Min:          return DoSimdBinop(FloatMin<f64>);
-    case O::F64X2Max:          return DoSimdBinop(FloatMax<f64>);
     case O::F64X2PMin:         return DoSimdBinop(FloatPMin<f64>);
     case O::F64X2PMax:         return DoSimdBinop(FloatPMax<f64>);
 
-    case O::I32X4TruncSatF32X4S: return DoSimdUnop(IntTruncSat<s32, f32>);
-    case O::I32X4TruncSatF32X4U: return DoSimdUnop(IntTruncSat<u32, f32>);
+    case O::F64X2Min:
+    case O::F64X2RelaxedMin:
+      return DoSimdBinop(FloatMin<f64>);
+
+    case O::F64X2Max:
+    case O::F64X2RelaxedMax:
+      return DoSimdBinop(FloatMax<f64>);
+
+    case O::I32X4TruncSatF32X4S:
+    case O::I32X4RelaxedTruncF32X4S:
+      return DoSimdUnop(IntTruncSat<s32, f32>);
+
+    case O::I32X4TruncSatF32X4U:
+    case O::I32X4RelaxedTruncF32X4U:
+      return DoSimdUnop(IntTruncSat<u32, f32>);
+
+    case O::I32X4TruncSatF64X2SZero:
+    case O::I32X4RelaxedTruncF64X2SZero:
+      return DoSimdUnopZero(IntTruncSat<s32, f64>);
+
+    case O::I32X4TruncSatF64X2UZero:
+    case O::I32X4RelaxedTruncF64X2UZero:
+      return DoSimdUnopZero(IntTruncSat<u32, f64>);
+
     case O::F32X4ConvertI32X4S:  return DoSimdUnop(Convert<f32, s32>);
     case O::F32X4ConvertI32X4U:  return DoSimdUnop(Convert<f32, u32>);
     case O::F32X4DemoteF64X2Zero: return DoSimdUnopZero(Convert<f32, f64>);
     case O::F64X2PromoteLowF32X4: return DoSimdConvert<f64x2, f32x4, true>();
-    case O::I32X4TruncSatF64X2SZero: return DoSimdUnopZero(IntTruncSat<s32, f64>);
-    case O::I32X4TruncSatF64X2UZero: return DoSimdUnopZero(IntTruncSat<u32, f64>);
     case O::F64X2ConvertLowI32X4S: return DoSimdConvert<f64x2, s32x4, true>();
     case O::F64X2ConvertLowI32X4U: return DoSimdConvert<f64x2, u32x4, true>();
 
-    case O::I8X16Swizzle:     return DoSimdSwizzle();
+    case O::I8X16Swizzle:
+    case O::I8X16RelaxedSwizzle:
+      return DoSimdSwizzle();
+
     case O::I8X16Shuffle:     return DoSimdShuffle(instr);
 
     case O::V128Load8Splat:    return DoSimdLoadSplat<u8x16>(instr, out_trap);
@@ -1705,9 +1828,18 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::I64X2ExtmulLowI32X4U: return DoSimdExtmul<u64x2, u32x4, true>();
     case O::I64X2ExtmulHighI32X4U: return DoSimdExtmul<u64x2, u32x4, false>();
 
-    case O::I16X8Q15mulrSatS: return DoSimdBinop(SaturatingRoundingQMul<s16>);
+    case O::I16X8Q15mulrSatS:
+    case O::I16X8RelaxedQ15mulrS:
+      return DoSimdBinop(SaturatingRoundingQMul<s16>);
 
     case O::I32X4DotI16X8S: return DoSimdDot<u32x4, s16x8>();
+    case O::I16X8DotI8X16I7X16S: return DoSimdDot<u16x8, s8x16>();
+    case O::I32X4DotI8X16I7X16AddS: return DoSimdDotAdd<u32x4, s16x8>();
+
+    case O::F32X4RelaxedMadd: return DoSimdRelaxedMadd<f32>();
+    case O::F32X4RelaxedNmadd: return DoSimdRelaxedNmadd<f32>();
+    case O::F64X2RelaxedMadd: return DoSimdRelaxedMadd<f64>();
+    case O::F64X2RelaxedNmadd: return DoSimdRelaxedNmadd<f64>();
 
     case O::AtomicFence:
     case O::MemoryAtomicNotify:
@@ -1780,6 +1912,22 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::I64AtomicRmw16CmpxchgU: return DoAtomicRmwCmpxchg<u64, u16>(instr, out_trap);
     case O::I64AtomicRmw32CmpxchgU: return DoAtomicRmwCmpxchg<u64, u32>(instr, out_trap);
 
+    case O::Throw: {
+      u32 tag_index = instr.imm_u32;
+      Values params;
+      Ref tag_ref = inst_->tags()[tag_index];
+      Tag::Ptr tag{store_, tag_ref};
+      PopValues(tag->type().signature, &params);
+      Exception::Ptr exn = Exception::New(store_, tag_ref, params);
+      return DoThrow(exn);
+    }
+    case O::Rethrow: {
+      u32 exn_index = instr.imm_u32;
+      Exception::Ptr exn{store_,
+                         exceptions_[exceptions_.size() - exn_index - 1]};
+      return DoThrow(exn);
+    }
+
     // The following opcodes are either never generated or should never be
     // executed.
     case O::Nop:
@@ -1796,13 +1944,12 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::Catch:
     case O::CatchAll:
     case O::Delegate:
-    case O::Throw:
-    case O::Rethrow:
     case O::InterpData:
     case O::Invalid:
       WABT_UNREACHABLE;
       break;
   }
+  // clang-format on
 
   return RunResult::Ok;
 }
@@ -2238,8 +2385,7 @@ RunResult Thread::DoSimdShuffle(Instr instr) {
   auto lhs = Pop<S>();
   S result;
   for (u8 i = 0; i < S::lanes; ++i) {
-    result[i] =
-        sel[i] < S::lanes ? lhs[sel[i]] : rhs[sel[i] - S::lanes];
+    result[i] = sel[i] < S::lanes ? lhs[sel[i]] : rhs[sel[i] - S::lanes];
   }
   Push(result);
   return RunResult::Ok;
@@ -2309,7 +2455,7 @@ RunResult Thread::DoSimdExtaddPairwise() {
   using U = typename S::LaneType;
   for (u8 i = 0; i < S::lanes; ++i) {
     u8 laneidx = i * 2;
-    result[i] = U(val[laneidx]) + U(val[laneidx+1]);
+    result[i] = U(val[laneidx]) + U(val[laneidx + 1]);
   }
   Push(result);
   return RunResult::Ok;
@@ -2324,8 +2470,54 @@ RunResult Thread::DoSimdDot() {
   for (u8 i = 0; i < S::lanes; ++i) {
     u8 laneidx = i * 2;
     SL lo = SL(lhs[laneidx]) * SL(rhs[laneidx]);
-    SL hi = SL(lhs[laneidx+1]) * SL(rhs[laneidx+1]);
+    SL hi = SL(lhs[laneidx + 1]) * SL(rhs[laneidx + 1]);
     result[i] = Add(lo, hi);
+  }
+  Push(result);
+  return RunResult::Ok;
+}
+
+template <typename S, typename T>
+RunResult Thread::DoSimdDotAdd() {
+  using SL = typename S::LaneType;
+  auto acc = Pop<S>();
+  auto rhs = Pop<T>();
+  auto lhs = Pop<T>();
+  S result;
+  for (u8 i = 0; i < S::lanes; ++i) {
+    u8 laneidx = i * 2;
+    SL lo = SL(lhs[laneidx]) * SL(rhs[laneidx]);
+    SL hi = SL(lhs[laneidx + 1]) * SL(rhs[laneidx + 1]);
+    result[i] = Add(lo, hi);
+    result[i] = Add(result[i], acc[i]);
+  }
+  Push(result);
+  return RunResult::Ok;
+}
+
+template <typename S>
+RunResult Thread::DoSimdRelaxedMadd() {
+  using SS = typename Simd128<S>::Type;
+  auto c = Pop<SS>();
+  auto b = Pop<SS>();
+  auto a = Pop<SS>();
+  SS result;
+  for (u8 i = 0; i < SS::lanes; ++i) {
+    result[i] = a[i] * b[i] + c[i];
+  }
+  Push(result);
+  return RunResult::Ok;
+}
+
+template <typename S>
+RunResult Thread::DoSimdRelaxedNmadd() {
+  using SS = typename Simd128<S>::Type;
+  auto c = Pop<SS>();
+  auto b = Pop<SS>();
+  auto a = Pop<SS>();
+  SS result;
+  for (u8 i = 0; i < SS::lanes; ++i) {
+    result[i] = -(a[i] * b[i]) + c[i];
   }
   Push(result);
   return RunResult::Ok;
@@ -2384,6 +2576,96 @@ RunResult Thread::DoAtomicRmwCmpxchg(Instr instr, Trap::Ptr* out_trap) {
   return RunResult::Ok;
 }
 
+RunResult Thread::DoThrow(Exception::Ptr exn) {
+  Istream::Offset target_offset = Istream::kInvalidOffset;
+  u32 target_values, target_exceptions;
+  Tag::Ptr exn_tag{store_, exn->tag()};
+  bool popped_frame = false;
+  bool had_catch_all = false;
+
+  // DoThrow is responsible for unwinding the stack at the point at which an
+  // exception is thrown, and also branching to the appropriate catch within
+  // the target try-catch. In a compiler, the tag dispatch might be done in
+  // generated code in a landing pad, but this is easier for the interpreter.
+  while (!frames_.empty()) {
+    const Frame& frame = frames_.back();
+    DefinedFunc::Ptr func{store_, frame.func};
+    u32 pc = frame.offset;
+    auto handlers = func->desc().handlers;
+
+    // We iterate in reverse order, in order to traverse handlers from most
+    // specific (pushed last) to least specific within a nested stack of
+    // try-catch blocks.
+    auto iter = handlers.rbegin();
+    while (iter != handlers.rend()) {
+      const HandlerDesc& handler = *iter;
+      if (pc >= handler.try_start_offset && pc < handler.try_end_offset) {
+        // For a try-delegate, skip part of the traversal by directly going
+        // up to an outer handler specified by the delegate depth.
+        if (handler.kind == HandlerKind::Delegate) {
+          // Subtract one as we're trying to get a reverse iterator that is
+          // offset by `delegate_handler_index` from the first item.
+          iter = handlers.rend() - handler.delegate_handler_index - 1;
+          continue;
+        }
+        // Otherwise, check for a matching catch tag or catch_all.
+        for (auto _catch : handler.catches) {
+          // Here we have to be careful to use the target frame's instance
+          // to look up the tag rather than the throw's instance.
+          Ref catch_tag_ref = frame.inst->tags()[_catch.tag_index];
+          Tag::Ptr catch_tag{store_, catch_tag_ref};
+          if (exn_tag == catch_tag) {
+            target_offset = _catch.offset;
+            target_values = (*iter).values;
+            target_exceptions = (*iter).exceptions;
+            goto found_handler;
+          }
+        }
+        if (handler.catch_all_offset != Istream::kInvalidOffset) {
+          target_offset = handler.catch_all_offset;
+          target_values = (*iter).values;
+          target_exceptions = (*iter).exceptions;
+          had_catch_all = true;
+          goto found_handler;
+        }
+      }
+      iter++;
+    }
+    frames_.pop_back();
+    popped_frame = true;
+  }
+
+  // If the call frames are empty now, the exception is uncaught.
+  assert(frames_.empty());
+  return RunResult::Exception;
+
+found_handler:
+  assert(target_offset != Istream::kInvalidOffset);
+
+  Frame& target_frame = frames_.back();
+  // If the throw crosses call frames, we need to reset the state to that
+  // call frame's values. The stack heights may need to be offset by the
+  // handler's heights as we may be jumping into the middle of the function
+  // code after some stack height changes.
+  if (popped_frame) {
+    inst_ = target_frame.inst;
+    mod_ = target_frame.mod;
+  }
+  values_.resize(target_frame.values + target_values);
+  exceptions_.resize(target_frame.exceptions + target_exceptions);
+  // Jump to the handler.
+  target_frame.offset = target_offset;
+  // When an exception is caught, it needs to be tracked in a stack
+  // to allow for rethrows. This stack is popped on leaving the try-catch
+  // or by control instructions such as `br`.
+  exceptions_.push_back(exn.ref());
+  // Also push exception payload values if applicable.
+  if (!had_catch_all) {
+    PushValues(exn_tag->type().signature, exn->args());
+  }
+  return RunResult::Ok;
+}
+
 Thread::TraceSource::TraceSource(Thread* thread) : thread_(thread) {}
 
 std::string Thread::TraceSource::Header(Istream::Offset offset) {
@@ -2406,8 +2688,8 @@ std::string Thread::TraceSource::Pick(Index index, Instr instr) {
     }
   }
   auto type = index > num_operands
-    ? Type(ValueType::Void)
-    : instr.op.GetParamType(num_operands - index + 1);
+                  ? Type(ValueType::Void)
+                  : instr.op.GetParamType(num_operands - index + 1);
   if (type == ValueType::Void) {
     // Void should never be displayed normally; we only expect to see it when
     // the stack may have different a different type. This is likely to occur

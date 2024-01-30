@@ -20,10 +20,10 @@ import difflib
 import fnmatch
 import multiprocessing
 import os
+import platform
 import re
 import shlex
 import shutil
-import struct
 import subprocess
 import sys
 import threading
@@ -38,7 +38,6 @@ REPO_ROOT_DIR = os.path.dirname(TEST_DIR)
 OUT_DIR = os.path.join(REPO_ROOT_DIR, 'out')
 DEFAULT_TIMEOUT = 120    # seconds
 SLOW_TIMEOUT_MULTIPLIER = 3
-
 
 # default configurations for tests
 TOOLS = {
@@ -130,9 +129,9 @@ TOOLS = {
         ('RUN', '%(wasm-decompile)s %(temp_file)s.wasm'),
         ('VERBOSE-ARGS', ['--print-cmd', '-v']),
     ],
-    'run-opcodecnt': [
+    'run-stats': [
         ('RUN', '%(wat2wasm)s %(in_file)s -o %(temp_file)s.wasm'),
-        ('RUN', '%(wasm-opcodecnt)s %(temp_file)s.wasm'),
+        ('RUN', '%(wasm-stats)s %(temp_file)s.wasm'),
         ('VERBOSE-ARGS', ['--print-cmd', '-v']),
     ],
     'run-gen-spec-js': [
@@ -146,21 +145,20 @@ TOOLS = {
             '%(in_file)s',
             '--bindir=%(bindir)s',
             '--no-error-cmdline',
-            '--cflags=-DWABT_BIG_ENDIAN=' + '01'[struct.pack('<h', *struct.unpack('=h', b'\x00\x01'))[0]],
             '-o',
             '%(out_dir)s',
         ]),
         ('VERBOSE-ARGS', ['--print-cmd', '-v']),
+    ],
+    'run-wasm2c': [
+        ('RUN', '%(wat2wasm)s %(in_file)s -o %(temp_file)s.wasm'),
+        ('RUN', '%(wasm2c)s -n test %(temp_file)s.wasm'),
     ],
     'run-wasm-decompile': [
         ('RUN', '%(wat2wasm)s --enable-all %(in_file)s -o %(temp_file)s.wasm'),
         ('RUN', '%(wasm-decompile)s --enable-all %(temp_file)s.wasm'),
     ]
 }
-
-# TODO(binji): Add Windows support for compiling using run-spec-wasm2c.py
-if IS_WINDOWS:
-    TOOLS['run-spec-wasm2c'].append(('SKIP', ''))
 
 ROUNDTRIP_TOOLS = ('wat2wasm',)
 
@@ -382,6 +380,7 @@ class TestInfo(object):
         self.slow = False
         self.skip = False
         self.is_roundtrip = False
+        self.is_wasm2c = False
 
     def CreateRoundtripInfo(self, fold_exprs):
         if self.tool not in ROUNDTRIP_TOOLS:
@@ -451,6 +450,7 @@ class TestInfo(object):
         if tool not in TOOLS:
             raise Error('Unknown tool: %s' % tool)
         self.tool = tool
+        self.is_wasm2c = self.tool == 'run-spec-wasm2c'
         for tool_key, tool_value in TOOLS[tool]:
             self.ParseDirective(tool_key, tool_value)
 
@@ -501,6 +501,10 @@ class TestInfo(object):
         elif key == 'ENV':
             # Pattern: FOO=1 BAR=stuff
             self.env = dict(x.split('=') for x in value.split())
+        elif key == 'PLATFORMS':
+            self.skip = platform.system() not in value.split()
+        elif key == 'NOT-PLATFORMS':
+            self.skip = platform.system() in value.split()
         else:
             raise Error('Unknown directive: %s' % key)
 
@@ -664,7 +668,7 @@ class Status(object):
         assert(self.isatty)
         total_duration = time.time() - self.start_time
         name = info.GetName() if info else ''
-        if (self.total - self.skipped):
+        if self.total - self.skipped:
             percent = 100 * (self.passed + self.failed) / (self.total - self.skipped)
         else:
             percent = 100
@@ -707,6 +711,16 @@ def GetAllTestInfo(test_names, status):
     return infos
 
 
+def CanonicalizePath(path):
+    """In order to get identical test results we canonicalize path
+    names that we pass into test code.  We use posix path separators
+    because they work sufficiently well on all platforms (including
+    windows)."""
+    # For some reason this doesn't work on winows:
+    # return str(pathlib.PurePosixPath(path))
+    return path.replace(os.path.sep, '/')
+
+
 def RunTest(info, options, variables, verbose_level=0):
     timeout = options.timeout
     if info.slow:
@@ -719,9 +733,8 @@ def RunTest(info, options, variables, verbose_level=0):
     env = dict(os.environ)
     env.update(info.env)
     gen_input_path = info.CreateInputFile()
-    rel_gen_input_path = (
-        os.path.relpath(gen_input_path, cwd).replace(os.path.sep, '/'))
-    variables['in_file'] = rel_gen_input_path
+    rel_gen_input_path = os.path.relpath(gen_input_path, cwd)
+    variables['in_file'] = CanonicalizePath(rel_gen_input_path)
 
     # Each test runs with a unique output directory which is removed before
     # we run the test.
@@ -729,13 +742,13 @@ def RunTest(info, options, variables, verbose_level=0):
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir)
-    variables['out_dir'] = out_dir
+    variables['out_dir'] = CanonicalizePath(out_dir)
 
     # Temporary files typically are placed in `out_dir` and use the same test's
     # basename. This name does include an extension.
     input_basename = os.path.basename(rel_gen_input_path)
-    variables['temp_file'] = os.path.join(out_dir,
-                                          os.path.splitext(input_basename)[0])
+    temp_file = os.path.join(out_dir, os.path.splitext(input_basename)[0])
+    variables['temp_file'] = CanonicalizePath(temp_file)
 
     test_result = TestResult()
 
@@ -773,6 +786,11 @@ def HandleTestResult(status, info, result, rebase=False):
                 status.Passed(info, result.duration)
         else:
             if result.Failed():
+                if result.GetLastFailure().returncode == 3:
+                    # run-spec-wasm2c.py returns 3 to signal that the test
+                    # should be skipped.
+                    status.Skipped(info)
+                    return
                 # This test has already failed, but diff it anyway.
                 last_failure = result.GetLastFailure()
                 msg = 'expected error code %d, got %d.' % (
@@ -910,7 +928,10 @@ def main(args):
                         action='store_true')
     parser.add_argument('patterns', metavar='pattern', nargs='*',
                         help='test patterns.')
+    parser.add_argument('--exclude-dir', action='append', default=[],
+                        help='directory to exclude.')
     options = parser.parse_args(args)
+    exclude_dirs = options.exclude_dir
 
     if options.jobs != 1:
         if options.fail_fast:
@@ -919,7 +940,6 @@ def main(args):
             parser.error('--stop-interactive only works with -j1')
 
     if options.patterns:
-        exclude_dirs = []
         pattern_re = '|'.join(
             fnmatch.translate('*%s*' % p) for p in options.patterns)
     else:
@@ -927,7 +947,7 @@ def main(args):
         # By default, exclude wasi tests because WASI support is not include
         # by int the build by default.
         # TODO(sbc): Find some way to detect the WASI support.
-        exclude_dirs = ['wasi']
+        exclude_dirs += ['wasi']
 
     test_names = FindTestFiles('.txt', pattern_re, exclude_dirs)
 

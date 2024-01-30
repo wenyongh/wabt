@@ -6,13 +6,16 @@ on:
     types:
       - created
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: build
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-20.04, macos-12, windows-latest]
     defaults:
       run:
         shell: bash
@@ -26,11 +29,11 @@ jobs:
 
     - name: install ninja (linux)
       run: sudo apt-get install ninja-build
-      if: matrix.os == 'ubuntu-latest'
+      if: startsWith(matrix.os, 'ubuntu-')
 
     - name: install ninja (osx)
       run: brew install ninja
-      if: matrix.os == 'macos-latest'
+      if: matrix.os == 'macos-12'
 
     - name: install ninja (win)
       run: choco install ninja
@@ -55,36 +58,25 @@ jobs:
       run: find bin/ -type f -perm -u=x -exec strip {} +
       if: matrix.os != 'windows-latest'
 
-    - name: archive
-      id: archive
+    - uses: ./.github/actions/release-archive
+      with:
+        os: ${{ matrix.os }}
+        upload_to_release: true
+
+  build-wasi:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: true
+
+    - name: built-tools
       run: |
-        OSNAME=$(echo ${{ matrix.os }} | sed 's/-latest//')
-        VERSION=${{ github.event.release.tag_name }}
-        PKGNAME="wabt-$VERSION-$OSNAME"
-        TARBALL=$PKGNAME.tar.gz
-        SHASUM=$PKGNAME.tar.gz.sha256
-        mv install wabt-$VERSION
-        tar -czf $TARBALL wabt-$VERSION
-        scripts/sha256sum.py $TARBALL > $SHASUM
-        echo "::set-output name=tarball::$TARBALL"
-        echo "::set-output name=shasum::$SHASUM"
+        docker run -di --name wasi-sdk -v $(pwd):/src --workdir /src ghcr.io/webassembly/wasi-sdk:wasi-sdk-20 bash
+        docker exec wasi-sdk cmake -S . -B out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=install -DBUILD_TESTS=0 -DBUILD_LIBWASM=0
+        docker exec wasi-sdk cmake --build out --config Release --target install
 
-    - name: upload tarball
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - uses: ./.github/actions/release-archive
       with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./${{ steps.archive.outputs.tarball }}
-        asset_name: ${{ steps.archive.outputs.tarball }}
-        asset_content_type: application/gzip
-
-    - name: upload shasum
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./${{ steps.archive.outputs.shasum }}
-        asset_name: ${{ steps.archive.outputs.shasum }}
-        asset_content_type: text/plain
+        os: wasi
+        upload_to_release: true

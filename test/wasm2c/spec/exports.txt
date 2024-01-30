@@ -1,6 +1,5 @@
-;;; SLOW:
 ;;; TOOL: run-spec-wasm2c
 ;;; STDIN_FILE: third_party/testsuite/exports.wast
 (;; STDOUT ;;;
-6/6 tests passed.
+9/9 tests passed.
 ;;; STDOUT ;;)

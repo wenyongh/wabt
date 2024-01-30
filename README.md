@@ -14,7 +14,7 @@ WABT (we pronounce it "wabbit") is a suite of tools for WebAssembly, including:
  - [**wasm-strip**](https://webassembly.github.io/wabt/doc/wasm-strip.1.html): remove sections of a WebAssembly binary file
  - [**wasm-validate**](https://webassembly.github.io/wabt/doc/wasm-validate.1.html): validate a file in the WebAssembly binary format
  - [**wast2json**](https://webassembly.github.io/wabt/doc/wast2json.1.html): convert a file in the wasm spec test format to a JSON file and associated wasm binary files
- - [**wasm-opcodecnt**](https://webassembly.github.io/wabt/doc/wasm-opcodecnt.1.html): count opcode usage for instructions
+ - [**wasm-stats**](https://webassembly.github.io/wabt/doc/wasm-stats.1.html): output stats for a module
  - [**spectest-interp**](https://webassembly.github.io/wabt/doc/spectest-interp.1.html): read a Spectest JSON file, and run its tests in the interpreter
 
 These tools are intended for use in (or for development of) toolchains or other
@@ -43,21 +43,25 @@ Wabt has been compiled to JavaScript via emscripten. Some of the functionality i
 * text: Whether wabt can read/write the text format
 * validate: Whether wabt can validate the syntax
 * interpret: Whether wabt can execute these operations in `wasm-interp` or `spectest-interp`
+* wasm2c: Whether wasm2c supports these operations
 
-| Proposal | flag | default | binary | text | validate | interpret |
-| - | - | - | - | - | - | - |
-| [exception handling][] | `--enable-exceptions` | | ✓ | ✓ | ✓ | ✓ |
-| [mutable globals][] | `--disable-mutable-globals` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| [nontrapping float-to-int conversions][] | `--disable-saturating-float-to-int` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| [sign extension][] | `--disable-sign-extension` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| [simd][] | `--enable-simd` | | ✓ | ✓ | ✓ | ✓ |
-| [threads][] | `--enable-threads` | | ✓ | ✓ | ✓ | ✓ |
-| [multi-value][] | `--disable-multi-value` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| [tail-call][] | `--enable-tail-call` | | ✓ | ✓ | ✓ | ✓ |
-| [bulk memory][] | `--enable-bulk-memory` | | ✓ | ✓ | ✓ | ✓ |
-| [reference types][] | `--enable-reference-types` | | ✓ | ✓ | ✓ | ✓ |
-| [annotations][] | `--enable-annotations` | | | ✓ | | |
-| [memory64][] | `--enable-memory64` | | | | | |
+| Proposal   | flag | default | binary | text | validate | interpret | wasm2c |
+| --------------------- | --------------------------- | - | - | - | - | - | - |
+| [exception handling][]| `--enable-exceptions`       |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [mutable globals][]   | `--disable-mutable-globals` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [nontrapping float-to-int conversions][] | `--disable-saturating-float-to-int` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [sign extension][]    | `--disable-sign-extension`  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [simd][]              | `--disable-simd`            | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [threads][]           | `--enable-threads`          |   | ✓ | ✓ | ✓ | ✓ |   |
+| [multi-value][]       | `--disable-multi-value`     | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [tail-call][]         | `--enable-tail-call`        |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [bulk memory][]       | `--disable-bulk-memory`     | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [reference types][]   | `--disable-reference-types` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [annotations][]       | `--enable-annotations`      |   |   | ✓ |   |   |   |
+| [memory64][]          | `--enable-memory64`         |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [multi-memory][]      | `--enable-multi-memory`     |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [extended-const][]    | `--enable-extended-const`   |   | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [relaxed-simd][]      | `--enable-relaxed-simd`     |   | ✓ | ✓ | ✓ | ✓ |   |
 
 [exception handling]: https://github.com/WebAssembly/exception-handling
 [mutable globals]: https://github.com/WebAssembly/mutable-global
@@ -71,6 +75,9 @@ Wabt has been compiled to JavaScript via emscripten. Some of the functionality i
 [reference types]: https://github.com/WebAssembly/reference-types
 [annotations]: https://github.com/WebAssembly/annotations
 [memory64]: https://github.com/WebAssembly/memory64
+[multi-memory]: https://github.com/WebAssembly/multi-memory
+[extended-const]: https://github.com/WebAssembly/extended-const
+[relaxed-simd]: https://github.com/WebAssembly/relaxed-simd
 
 ## Cloning
 
@@ -127,7 +134,7 @@ There are many make targets available for other configurations as well. They
 are generated from every combination of a compiler, build type and
 configuration.
 
- - compilers: `gcc`, `clang`, `gcc-i686`, `emcc`
+ - compilers: `gcc`, `clang`, `gcc-i686`, `emscripten`
  - build types: `debug`, `release`
  - configurations: empty, `asan`, `msan`, `lsan`, `ubsan`, `fuzz`, `no-tests`
 
@@ -144,7 +151,7 @@ $ make gcc-debug-no-tests
 
 You'll need [CMake](https://cmake.org). You'll also need
 [Visual Studio](https://www.visualstudio.com/) (2015 or newer) or
-[MinGW](http://www.mingw.org/).
+[MinGW](https://www.mingw-w64.org/).
 
 _Note: Visual Studio 2017 and later come with CMake (and the Ninja build system)
 out of the box, and should be on your PATH if you open a Developer Command prompt.
@@ -195,7 +202,7 @@ run `make update-gperf` to update the prebuilt C++ sources in `src/prebuilt/`.
 Some examples:
 
 ```sh
-# parse and typecheck test.wat
+# parse test.wat and write to .wasm binary file with the same name
 $ bin/wat2wasm test.wat
 
 # parse test.wat and write to binary file test.wasm
@@ -305,7 +312,7 @@ $ make clang-debug-ubsan
 ```
 
 There are configurations for the Address Sanitizer (ASAN), Memory Sanitizer
-(MSAN), Leak Sanitizer (LSAN) and Undefine Behavior Sanitizer (UBSAN). You can
+(MSAN), Leak Sanitizer (LSAN) and Undefined Behavior Sanitizer (UBSAN). You can
 read about the behaviors of the sanitizers in the link above, but essentially
 the Address Sanitizer finds invalid memory accesses (use after free, access
 out-of-bounds, etc.), Memory Sanitizer finds uses of uninitialized memory,

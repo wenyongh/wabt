@@ -15,6 +15,5 @@ section(CODE) {
   }
 }
 (;; STDERR ;;;
-error: Unexpected instruction after end of function
-000001a: error: OnOpcode callback failed
+0000019: error: function body shorter than given size
 ;;; STDERR ;;)

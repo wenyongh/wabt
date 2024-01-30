@@ -55,11 +55,11 @@ def FilesAreEqual(filename1, filename2, verbose=False):
     return (OK, '')
 
 
-def TwoRoundtrips(wat2wasm, wasm2wat, out_dir, filename, verbose):
+def DoRoundtrip(wat2wasm, wasm2wat, out_dir, filename, verbose, stdout):
     basename = os.path.basename(filename)
     basename_noext = os.path.splitext(basename)[0]
     wasm1_file = os.path.join(out_dir, basename_noext + '-1.wasm')
-    wast2_file = os.path.join(out_dir, basename_noext + '-2.wast')
+    wat2_file = os.path.join(out_dir, basename_noext + '-2.wat')
     wasm3_file = os.path.join(out_dir, basename_noext + '-3.wasm')
     try:
         wat2wasm.RunWithArgs('-o', wasm1_file, filename)
@@ -68,28 +68,16 @@ def TwoRoundtrips(wat2wasm, wasm2wat, out_dir, filename, verbose):
         # test)
         return (SKIPPED, None)
     try:
-        wasm2wat.RunWithArgs('-o', wast2_file, wasm1_file)
-        wat2wasm.RunWithArgs('-o', wasm3_file, wast2_file)
+        wasm2wat.RunWithArgs('-o', wat2_file, wasm1_file)
+        wat2wasm.RunWithArgs('-o', wasm3_file, wat2_file)
     except Error as e:
         return (ERROR, str(e))
-    return FilesAreEqual(wasm1_file, wasm3_file, verbose)
-
-
-def OneRoundtripToStdout(wat2wasm, wasm2wat, out_dir, filename, verbose):
-    basename = os.path.basename(filename)
-    basename_noext = os.path.splitext(basename)[0]
-    wasm_file = os.path.join(out_dir, basename_noext + '.wasm')
-    try:
-        wat2wasm.RunWithArgs('-o', wasm_file, filename)
-    except Error:
-        # if the file doesn't parse properly, just skip it (it may be a "bad-*"
-        # test)
-        return (SKIPPED, None)
-    try:
-        wasm2wat.RunWithArgs(wasm_file)
-    except Error as e:
-        return (ERROR, str(e))
-    return (OK, '')
+    if stdout:
+        with open(wat2_file) as f:
+            sys.stdout.write(f.read())
+        return (OK, '')
+    else:
+        return FilesAreEqual(wasm1_file, wasm3_file, verbose)
 
 
 def main(args):
@@ -102,7 +90,7 @@ def main(args):
                         default=find_exe.GetDefaultPath(),
                         help='directory to search for all executables.')
     parser.add_argument('--stdout', action='store_true',
-                        help='do one roundtrip and write wast output to stdout')
+                        help='do one roundtrip and write wat output to stdout')
     parser.add_argument('--no-error-cmdline',
                         help='don\'t display the subprocess\'s commandline when '
                         'an error occurs', dest='error_cmdline',
@@ -118,13 +106,14 @@ def main(args):
     parser.add_argument('--enable-saturating-float-to-int', action='store_true')
     parser.add_argument('--enable-function-references', action='store_true')
     parser.add_argument('--enable-threads', action='store_true')
-    parser.add_argument('--enable-simd', action='store_true')
     parser.add_argument('--enable-sign-extension', action='store_true')
     parser.add_argument('--enable-multi-value', action='store_true')
-    parser.add_argument('--enable-bulk-memory', action='store_true')
     parser.add_argument('--enable-tail-call', action='store_true')
-    parser.add_argument('--enable-reference-types', action='store_true')
+    parser.add_argument('--disable-reference-types', action='store_true')
     parser.add_argument('--enable-memory64', action='store_true')
+    parser.add_argument('--enable-multi-memory', action='store_true')
+    parser.add_argument('--enable-annotations', action='store_true')
+    parser.add_argument('--enable-code-metadata', action='store_true')
     parser.add_argument('--inline-exports', action='store_true')
     parser.add_argument('--inline-imports', action='store_true')
     parser.add_argument('--reloc', action='store_true')
@@ -141,13 +130,14 @@ def main(args):
         '--enable-saturating-float-to-int':
             options.enable_saturating_float_to_int,
         '--enable-sign-extension': options.enable_sign_extension,
-        '--enable-simd': options.enable_simd,
         '--enable-function-references': options.enable_function_references,
         '--enable-threads': options.enable_threads,
-        '--enable-bulk-memory': options.enable_bulk_memory,
         '--enable-tail-call': options.enable_tail_call,
-        '--enable-reference-types': options.enable_reference_types,
+        '--disable-reference-types': options.disable_reference_types,
         '--enable-memory64': options.enable_memory64,
+        '--enable-multi-memory': options.enable_multi_memory,
+        '--enable-annotations': options.enable_annotations,
+        '--enable-code-metadata': options.enable_code_metadata,
         '--reloc': options.reloc,
         '--no-check': options.no_check,
     })
@@ -162,13 +152,14 @@ def main(args):
         '--enable-saturating-float-to-int':
             options.enable_saturating_float_to_int,
         '--enable-sign-extension': options.enable_sign_extension,
-        '--enable-simd': options.enable_simd,
-        '--enable-bulk-memory': options.enable_bulk_memory,
         '--enable-tail-call': options.enable_tail_call,
         '--enable-function-references': options.enable_function_references,
-        '--enable-reference-types': options.enable_reference_types,
+        '--disable-reference-types': options.disable_reference_types,
         '--enable-threads': options.enable_threads,
         '--enable-memory64': options.enable_memory64,
+        '--enable-multi-memory': options.enable_multi_memory,
+        '--enable-annotations': options.enable_annotations,
+        '--enable-code-metadata': options.enable_code_metadata,
         '--inline-exports': options.inline_exports,
         '--inline-imports': options.inline_imports,
         '--no-debug-names': not options.debug_names,
@@ -185,12 +176,8 @@ def main(args):
         return ERROR
 
     with utils.TempDirectory(options.out_dir, 'roundtrip-') as out_dir:
-        if options.stdout:
-            result, msg = OneRoundtripToStdout(wat2wasm, wasm2wat, out_dir,
-                                               filename, options.verbose)
-        else:
-            result, msg = TwoRoundtrips(wat2wasm, wasm2wat, out_dir, filename,
-                                        options.verbose)
+        result, msg = DoRoundtrip(wat2wasm, wasm2wat, out_dir, filename,
+                                  options.verbose, options.stdout)
         if result == ERROR:
             sys.stderr.write(msg)
         return result

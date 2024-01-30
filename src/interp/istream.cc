@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "src/interp/istream.h"
+#include "wabt/interp/istream.h"
 
 #include <cinttypes>
 
@@ -83,6 +83,12 @@ void Istream::EmitDropKeep(u32 drop, u32 keep) {
     } else {
       Emit(Opcode::InterpDropKeep, drop, keep);
     }
+  }
+}
+
+void Istream::EmitCatchDrop(u32 drop) {
+  if (drop > 0) {
+    Emit(Opcode::InterpCatchDrop, drop);
   }
 }
 
@@ -249,6 +255,10 @@ Instr Istream::Read(Offset* offset) const {
     case Opcode::I16X8ExtaddPairwiseI8X16U:
     case Opcode::I32X4ExtaddPairwiseI16X8S:
     case Opcode::I32X4ExtaddPairwiseI16X8U:
+    case Opcode::I32X4RelaxedTruncF32X4S:
+    case Opcode::I32X4RelaxedTruncF32X4U:
+    case Opcode::I32X4RelaxedTruncF64X2SZero:
+    case Opcode::I32X4RelaxedTruncF64X2UZero:
       // 0 immediates, 1 operand.
       instr.kind = InstrKind::Imm_0_Op_1;
       break;
@@ -462,12 +472,28 @@ Instr Istream::Read(Offset* offset) const {
     case Opcode::V128Or:
     case Opcode::V128Xor:
     case Opcode::I8X16Swizzle:
+    case Opcode::I8X16RelaxedSwizzle:
+    case Opcode::F32X4RelaxedMin:
+    case Opcode::F32X4RelaxedMax:
+    case Opcode::F64X2RelaxedMin:
+    case Opcode::F64X2RelaxedMax:
+    case Opcode::I16X8RelaxedQ15mulrS:
+    case Opcode::I16X8DotI8X16I7X16S:
       // 0 immediates, 2 operands
       instr.kind = InstrKind::Imm_0_Op_2;
       break;
 
     case Opcode::Select:
     case Opcode::SelectT:
+    case Opcode::F32X4RelaxedMadd:
+    case Opcode::F32X4RelaxedNmadd:
+    case Opcode::F64X2RelaxedMadd:
+    case Opcode::F64X2RelaxedNmadd:
+    case Opcode::I8X16RelaxedLaneSelect:
+    case Opcode::I16X8RelaxedLaneSelect:
+    case Opcode::I32X4RelaxedLaneSelect:
+    case Opcode::I64X2RelaxedLaneSelect:
+    case Opcode::I32X4DotI8X16I7X16AddS:
       // 0 immediates, 3 operands
       instr.kind = InstrKind::Imm_0_Op_3;
       break;
@@ -493,6 +519,8 @@ Instr Istream::Read(Offset* offset) const {
     case Opcode::DataDrop:
     case Opcode::ElemDrop:
     case Opcode::RefFunc:
+    case Opcode::Throw:
+    case Opcode::Rethrow:
       // Index immediate, 0 operands.
       instr.kind = InstrKind::Imm_Index_Op_0;
       instr.imm_u32 = ReadAt<u32>(offset);
@@ -685,6 +713,8 @@ Instr Istream::Read(Offset* offset) const {
     case Opcode::AtomicFence:
     case Opcode::I32Const:
     case Opcode::InterpAlloca:
+    case Opcode::InterpCatchDrop:
+    case Opcode::InterpAdjustFrameForReturnCall:
       // i32/f32 immediate, 0 operands.
       instr.kind = InstrKind::Imm_I32_Op_0;
       instr.imm_u32 = ReadAt<u32>(offset);
@@ -762,8 +792,6 @@ Instr Istream::Read(Offset* offset) const {
     case Opcode::InterpData:
     case Opcode::Invalid:
     case Opcode::Loop:
-    case Opcode::Rethrow:
-    case Opcode::Throw:
     case Opcode::Try:
     case Opcode::ReturnCall:
       // Not used.
@@ -857,7 +885,7 @@ Istream::Offset Istream::Trace(Stream* stream,
       break;
 
     case InstrKind::Imm_Index_Op_N:
-      stream->Writef(" $%u\n", instr.imm_u32); // TODO param/result count?
+      stream->Writef(" $%u\n", instr.imm_u32);  // TODO param/result count?
       break;
 
     case InstrKind::Imm_Index_Index_Op_3:
@@ -891,9 +919,10 @@ Istream::Offset Istream::Trace(Stream* stream,
       break;
 
     case InstrKind::Imm_Index_Offset_Lane_Op_2:
-      stream->Writef(" $%u:%s+$%u, %s (Lane imm: $%u)\n", instr.imm_u32x2_u8.fst,
-                     source->Pick(2, instr).c_str(), instr.imm_u32x2_u8.snd,
-                     source->Pick(1, instr).c_str(), instr.imm_u32x2_u8.idx);
+      stream->Writef(" $%u:%s+$%u, %s (Lane imm: $%u)\n",
+                     instr.imm_u32x2_u8.fst, source->Pick(2, instr).c_str(),
+                     instr.imm_u32x2_u8.snd, source->Pick(1, instr).c_str(),
+                     instr.imm_u32x2_u8.idx);
       break;
 
     case InstrKind::Imm_I32_Op_0:

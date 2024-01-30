@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "src/leb128.h"
+#include "wabt/leb128.h"
 
 #include <type_traits>
 
-#include "src/stream.h"
+#include "wabt/stream.h"
 
 #define MAX_U32_LEB128_BYTES 5
 #define MAX_U64_LEB128_BYTES 10
@@ -239,8 +239,8 @@ size_t ReadU64Leb128(const uint8_t* p,
     *out_value = LEB128_9(uint64_t);
     return 9;
   } else if (p + 9 < end && (p[9] & 0x80) == 0) {
-    // The top bits set represent values > 32 bits.
-    if (p[9] & 0xf0) {
+    // The top bits set represent values > 64 bits.
+    if (p[9] & 0xfe) {
       return 0;
     }
     *out_value = LEB128_10(uint64_t);
